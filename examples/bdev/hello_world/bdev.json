@@ -12,6 +12,18 @@
           }
         }
       ]
+    },
+    {
+      "subsystem": "bdev",
+      "config": [
+	{
+          "method": "bdev_faulty_create",
+	  "params": {
+            "name": "Faulty0",
+	    "base_bdev_name": "Malloc0"
+	  }
+	}
+      ]
     }
   ]
 }

@@ -81,7 +81,7 @@ def bdev_compress_set_pmd(client, pmd):
     """Set pmd options for the bdev compress.
 
     Args:
-        pmd: 0 = auto-select, 1 = QAT, 2 = ISAL, 3 = mlx5_pci
+        pmd: 0 = auto-select, 1 = QAT, 2 = ISAL
     """
     params = {'pmd': pmd}
 
@@ -386,16 +386,6 @@ def bdev_aio_create(client, filename, name, block_size=None):
     return client.call('bdev_aio_create', params)
 
 
-def bdev_aio_rescan(client, name):
-    """Rescan a Linux AIO block device.
-
-    Args:
-        bdev_name: name of aio bdev to delete
-    """
-    params = {'name': name}
-    return client.call('bdev_aio_rescan', params)
-
-
 @deprecated_alias('delete_aio_bdev')
 def bdev_aio_delete(client, name):
     """Remove aio bdev from the system.
@@ -442,8 +432,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
                           keep_alive_timeout_ms=None, retry_count=None, arbitration_burst=None,
                           low_priority_weight=None, medium_priority_weight=None, high_priority_weight=None,
                           nvme_adminq_poll_period_us=None, nvme_ioq_poll_period_us=None, io_queue_requests=None,
-                          delay_cmd_submit=None, transport_retry_count=None, bdev_retry_count=None,
-                          transport_ack_timeout=None):
+                          delay_cmd_submit=None, transport_retry_count=None, bdev_retry_count=None):
     """Set options for the bdev nvme. This is startup command.
 
     Args:
@@ -453,17 +442,15 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
         keep_alive_timeout_ms: Keep alive timeout period in millisecond, default is 10s (optional)
         retry_count: The number of attempts per I/O when an I/O fails (deprecated) (optional)
         arbitration_burst: The value is expressed as a power of two (optional)
-        low_priority_weight: The number of commands that may be executed from the low priority queue at one time (optional)
-        medium_priority_weight: The number of commands that may be executed from the medium priority queue at one time (optional)
-        high_priority_weight: The number of commands that may be executed from the high priority queue at one time (optional)
+        low_prioity_weight: The number of commands that may be executed from the low priority queue at one time (optional)
+        medium_prioity_weight: The number of commands that may be executed from the medium priority queue at one time (optional)
+        high_prioity_weight: The number of commands that may be executed from the high priority queue at one time (optional)
         nvme_adminq_poll_period_us: How often the admin queue is polled for asynchronous events in microseconds (optional)
         nvme_ioq_poll_period_us: How often to poll I/O queues for completions in microseconds (optional)
         io_queue_requests: The number of requests allocated for each NVMe I/O queue. Default: 512 (optional)
         delay_cmd_submit: Enable delayed NVMe command submission to allow batching of multiple commands (optional)
         transport_retry_count: The number of attempts per I/O in the transport layer when an I/O fails (optional)
         bdev_retry_count: The number of attempts per I/O in the bdev layer when an I/O fails. -1 means infinite retries. (optional)
-        transport_ack_timeout: Time to wait ack until packet retransmission. RDMA specific.
-        Range 0-31 where 0 is driver-specific default value (optional)
     """
     params = {}
 
@@ -513,9 +500,6 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
     if bdev_retry_count is not None:
         params['bdev_retry_count'] = bdev_retry_count
 
-    if transport_ack_timeout is not None:
-        params['transport_ack_timeout'] = transport_ack_timeout
-
     return client.call('bdev_nvme_set_options', params)
 
 
@@ -539,9 +523,7 @@ def bdev_nvme_set_hotplug(client, enable, period_us=None):
 def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvcid=None,
                                 priority=None, subnqn=None, hostnqn=None, hostaddr=None,
                                 hostsvcid=None, prchk_reftag=None, prchk_guard=None,
-                                hdgst=None, ddgst=None, fabrics_timeout=None, multipath=None, num_io_queues=None,
-                                ctrlr_loss_timeout_sec=None, reconnect_delay_sec=None,
-                                fast_io_fail_timeout_sec=None):
+                                hdgst=None, ddgst=None, fabrics_timeout=None, multipath=None):
     """Construct block device for each NVMe namespace in the attached controller.
 
     Args:
@@ -561,21 +543,6 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
         ddgst: Enable TCP data digest (optional)
         fabrics_timeout: Fabrics connect timeout in us (optional)
         multipath: The behavior when multiple paths are created ("disable", "failover", or "multipath"; failover if not specified)
-        num_io_queues: The number of IO queues to request during initialization. (optional)
-        ctrlr_loss_timeout_sec: Time to wait until ctrlr is reconnected before deleting ctrlr.
-        -1 means infinite reconnect retries. 0 means no reconnect retry.
-        If reconnect_delay_sec is zero, ctrlr_loss_timeout_sec has to be zero.
-        If reconnect_delay_sec is non-zero, ctrlr_loss_timeout_sec has to be -1 or not less than reconnect_delay_sec.
-        (optional)
-        reconnect_delay_sec: Time to delay a reconnect retry.
-        If ctrlr_loss_timeout_sec is zero, reconnect_delay_sec has to be zero.
-        If ctrlr_loss_timeout_sec is -1, reconnect_delay_sec has to be non-zero.
-        If ctrlr_loss_timeout_sec is not -1 or zero, reconnect_sec has to be non-zero and less than ctrlr_loss_timeout_sec.
-        (optional)
-        fail_io_fast_timeout_sec: Time to wait until ctrlr is reconnected before failing I/O to ctrlr.
-        0 means no such timeout.
-        If fast_io_fail_timeout_sec is not zero, it has to be not less than reconnect_delay_sec and less than
-        ctrlr_loss_timeout_sec if ctrlr_loss_timeout_sec is not -1. (optional)
 
     Returns:
         Names of created block devices.
@@ -622,18 +589,6 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
 
     if multipath:
         params['multipath'] = multipath
-
-    if num_io_queues:
-        params['num_io_queues'] = num_io_queues
-
-    if ctrlr_loss_timeout_sec is not None:
-        params['ctrlr_loss_timeout_sec'] = ctrlr_loss_timeout_sec
-
-    if reconnect_delay_sec is not None:
-        params['reconnect_delay_sec'] = reconnect_delay_sec
-
-    if fast_io_fail_timeout_sec is not None:
-        params['fast_io_fail_timeout_sec'] = fast_io_fail_timeout_sec
 
     return client.call('bdev_nvme_attach_controller', params)
 
@@ -697,45 +652,6 @@ def bdev_nvme_reset_controller(client, name):
     return client.call('bdev_nvme_reset_controller', params)
 
 
-def bdev_nvme_start_discovery(client, name, trtype, traddr, adrfam=None, trsvcid=None,
-                              hostnqn=None):
-    """Start discovery with the specified discovery subsystem
-
-    Args:
-        name: bdev name prefix; "n" + namespace ID will be appended to create unique names
-        trtype: transport type ("PCIe", "RDMA", "FC", "TCP")
-        traddr: transport address (PCI BDF or IP address)
-        adrfam: address family ("IPv4", "IPv6", "IB", or "FC")
-        trsvcid: transport service ID (port number for IP-based addresses)
-        hostnqn: NQN to connect from (optional)
-    """
-    params = {'name': name,
-              'trtype': trtype,
-              'traddr': traddr}
-
-    if hostnqn:
-        params['hostnqn'] = hostnqn
-
-    if adrfam:
-        params['adrfam'] = adrfam
-
-    if trsvcid:
-        params['trsvcid'] = trsvcid
-
-    return client.call('bdev_nvme_start_discovery', params)
-
-
-def bdev_nvme_stop_discovery(client, name):
-    """Stop a previously started discovery service
-
-    Args:
-        name: name of discovery service to start
-    """
-    params = {'name': name}
-
-    return client.call('bdev_nvme_stop_discovery', params)
-
-
 def bdev_nvme_cuse_register(client, name):
     """Register CUSE devices on NVMe controller.
 
@@ -788,7 +704,7 @@ def bdev_zone_block_delete(client, name):
     return client.call('bdev_zone_block_delete', params)
 
 
-def bdev_rbd_register_cluster(client, name, user=None, config_param=None, config_file=None, key_file=None):
+def bdev_rbd_register_cluster(client, name, user=None, config_param=None, config_file=None):
     """Create a Rados Cluster object of the Ceph RBD backend.
 
     Args:
@@ -796,7 +712,6 @@ def bdev_rbd_register_cluster(client, name, user=None, config_param=None, config
         user: Ceph user name (optional)
         config_param: map of config keys to values (optional)
         config_file: file path of Ceph configuration file (optional)
-        key_file: file path of Ceph key file (optional)
 
     Returns:
         Name of registered Rados Cluster object.
@@ -809,8 +724,6 @@ def bdev_rbd_register_cluster(client, name, user=None, config_param=None, config
         params['config_param'] = config_param
     if config_file is not None:
         params['config_file'] = config_file
-    if key_file is not None:
-        params['key_file'] = key_file
 
     return client.call('bdev_rbd_register_cluster', params)
 
@@ -1065,6 +978,36 @@ def bdev_passthru_delete(client, name):
     """
     params = {'name': name}
     return client.call('bdev_passthru_delete', params)
+
+
+@deprecated_alias('construct_faulty_bdev')
+def bdev_faulty_create(client, base_bdev_name, name):
+    """Construct a pass-through block device.
+
+    Args:
+        base_bdev_name: name of the existing bdev
+        name: name of block device
+
+    Returns:
+        Name of created block device.
+    """
+    params = {
+        'base_bdev_name': base_bdev_name,
+        'name': name,
+    }
+    return client.call('bdev_faulty_create', params)
+
+
+@deprecated_alias('delete_faulty_bdev')
+def bdev_faulty_delete(client, name):
+    """Remove pass through bdev from the system.
+
+    Args:
+        name: name of pass through bdev to delete
+    """
+    params = {'name': name}
+    return client.call('bdev_faulty_delete', params)
+
 
 
 def bdev_opal_create(client, nvme_ctrlr_name, nsid, locking_range_id, range_start, range_length, password):

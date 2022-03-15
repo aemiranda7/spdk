@@ -48,6 +48,8 @@ endif
 
 APP := $(APP)$(EXEEXT)
 
+LIBS_FOLDER_INCLUDE := fault-injection-framework/libs/libfops/build
+
 LIBS += $(SPDK_LIB_LINKER_ARGS)
 
 CLEAN_FILES = $(APP)

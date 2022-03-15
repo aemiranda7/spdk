@@ -34,11 +34,11 @@
 
 BLOCKDEV_MODULES_LIST = bdev_malloc bdev_null bdev_nvme bdev_passthru bdev_lvol
 BLOCKDEV_MODULES_LIST += bdev_raid bdev_error bdev_gpt bdev_split bdev_delay
-BLOCKDEV_MODULES_LIST += bdev_zone_block
+BLOCKDEV_MODULES_LIST += bdev_zone_block bdev_faulty
 BLOCKDEV_MODULES_LIST += blobfs blobfs_bdev blob_bdev blob lvol vmd nvme
 
 # Some bdev modules don't have pollers, so they can directly run in interrupt mode
-INTR_BLOCKDEV_MODULES_LIST = bdev_malloc bdev_passthru bdev_error bdev_gpt bdev_split bdev_raid
+INTR_BLOCKDEV_MODULES_LIST = bdev_malloc bdev_passthru bdev_error bdev_gpt bdev_split bdev_raid bdev_faulty
 # Logical volume, blobstore and blobfs can directly run in both interrupt mode and poll mode.
 INTR_BLOCKDEV_MODULES_LIST += bdev_lvol blobfs blobfs_bdev blob_bdev blob lvol
 
@@ -48,9 +48,6 @@ endif
 
 ifeq ($(CONFIG_CRYPTO),y)
 BLOCKDEV_MODULES_LIST += bdev_crypto
-ifeq ($(CONFIG_CRYPTO_MLX5),y)
-BLOCKDEV_MODULES_PRIVATE_LIBS += -lmlx5 -libverbs
-endif
 endif
 
 ifeq ($(CONFIG_OCF),y)
@@ -62,7 +59,7 @@ ifeq ($(CONFIG_REDUCE),y)
 BLOCKDEV_MODULES_LIST += bdev_compress reduce
 BLOCKDEV_MODULES_PRIVATE_LIBS += -lpmem
 ifeq ($(CONFIG_REDUCE_MLX5),y)
-BLOCKDEV_MODULES_PRIVATE_LIBS += -lmlx5 -libverbs
+BLOCKDEV_MODULES_PRIVATE_LIBS += -lmlx5
 endif
 endif
 
@@ -129,6 +126,8 @@ endif
 endif
 
 EVENT_BDEV_SUBSYSTEM = event_bdev event_accel event_vmd event_sock
+
+BLOCKDEV_MODULES_PRIVATE_LIBS += -L/home/gsd/fault-injection-framework/libs/libfops/build -lfops
 
 ALL_MODULES_LIST = $(BLOCKDEV_MODULES_LIST) $(ACCEL_MODULES_LIST) $(SCHEDULER_MODULES_LIST) $(SOCK_MODULES_LIST)
 SYS_LIBS += $(BLOCKDEV_MODULES_PRIVATE_LIBS)
