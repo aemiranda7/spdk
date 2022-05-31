@@ -1135,7 +1135,7 @@ def bdev_passthru_delete(client, name):
     return client.call('bdev_passthru_delete', params)
 
 
-@deprecated_alias('construct_faulty_bdev')
+
 def bdev_faulty_create(client, base_bdev_name, name):
     """Construct a pass-through block device.
 
@@ -1153,7 +1153,7 @@ def bdev_faulty_create(client, base_bdev_name, name):
     return client.call('bdev_faulty_create', params)
 
 
-@deprecated_alias('delete_faulty_bdev')
+
 def bdev_faulty_delete(client, name):
     """Remove pass through bdev from the system.
 

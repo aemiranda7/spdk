@@ -1,0 +1,5 @@
+write:
+  testfile:
+    injectFaults: true
+    frequency: 3
+    x: 3
