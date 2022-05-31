@@ -215,7 +215,6 @@ invalid:
 }
 
 SPDK_RPC_REGISTER("bdev_ftl_create", rpc_bdev_ftl_create, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_ftl_create, construct_ftl_bdev)
 
 struct rpc_delete_ftl {
 	char *name;
@@ -230,7 +229,11 @@ rpc_bdev_ftl_delete_cb(void *cb_arg, int bdeverrno)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
 
-	spdk_jsonrpc_send_bool_response(request, bdeverrno == 0);
+	if (bdeverrno == 0) {
+		spdk_jsonrpc_send_bool_response(request, true);
+	} else {
+		spdk_jsonrpc_send_error_response(request, bdeverrno, spdk_strerror(-bdeverrno));
+	}
 }
 
 static void
@@ -253,4 +256,3 @@ invalid:
 }
 
 SPDK_RPC_REGISTER("bdev_ftl_delete", rpc_bdev_ftl_delete, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_ftl_delete, delete_ftl_bdev)

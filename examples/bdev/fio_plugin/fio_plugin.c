@@ -66,6 +66,7 @@ struct spdk_fio_options {
 	void *pad;
 	char *conf;
 	char *json_conf;
+	char *env_context;
 	char *log_flags;
 	unsigned mem_mb;
 	int mem_single_seg;
@@ -129,27 +130,47 @@ static TAILQ_HEAD(, spdk_fio_thread) g_threads = TAILQ_HEAD_INITIALIZER(g_thread
 /* Default polling timeout (ns) */
 #define SPDK_FIO_POLLING_TIMEOUT 1000000000ULL
 
+static __thread bool g_internal_thread = false;
+
+static int
+spdk_fio_schedule_thread(struct spdk_thread *thread)
+{
+	struct spdk_fio_thread *fio_thread;
+
+	if (g_internal_thread) {
+		/* Do nothing. */
+		return 0;
+	}
+
+	fio_thread = spdk_thread_get_ctx(thread);
+
+	pthread_mutex_lock(&g_init_mtx);
+	TAILQ_INSERT_TAIL(&g_threads, fio_thread, link);
+	pthread_mutex_unlock(&g_init_mtx);
+
+	return 0;
+}
+
 static int
 spdk_fio_init_thread(struct thread_data *td)
 {
 	struct spdk_fio_thread *fio_thread;
+	struct spdk_thread *thread;
 
-	fio_thread = calloc(1, sizeof(*fio_thread));
-	if (!fio_thread) {
-		SPDK_ERRLOG("failed to allocate thread local context\n");
-		return -1;
-	}
-
-	fio_thread->td = td;
-	td->io_ops_data = fio_thread;
-
-	fio_thread->thread = spdk_thread_create("fio_thread", NULL);
-	if (!fio_thread->thread) {
-		free(fio_thread);
+	g_internal_thread = true;
+	thread = spdk_thread_create("fio_thread", NULL);
+	g_internal_thread = false;
+	if (!thread) {
 		SPDK_ERRLOG("failed to allocate thread\n");
 		return -1;
 	}
-	spdk_set_thread(fio_thread->thread);
+
+	fio_thread = spdk_thread_get_ctx(thread);
+	fio_thread->td = td;
+	fio_thread->thread = thread;
+	td->io_ops_data = fio_thread;
+
+	spdk_set_thread(thread);
 
 	fio_thread->iocq_size = td->o.iodepth;
 	fio_thread->iocq = calloc(fio_thread->iocq_size, sizeof(struct io_u *));
@@ -279,6 +300,9 @@ spdk_init_thread_poll(void *arg)
 		opts.mem_size = eo->mem_mb;
 	}
 	opts.hugepage_single_segments = eo->mem_single_seg;
+	if (eo->env_context) {
+		opts.env_context = eo->env_context;
+	}
 
 	if (spdk_env_init(&opts) < 0) {
 		SPDK_ERRLOG("Unable to initialize SPDK env\n");
@@ -302,7 +326,7 @@ spdk_init_thread_poll(void *arg)
 #endif
 	}
 
-	spdk_thread_lib_init(NULL, 0);
+	spdk_thread_lib_init(spdk_fio_schedule_thread, sizeof(struct spdk_fio_thread));
 
 	/* Create an SPDK thread temporarily */
 	rc = spdk_fio_init_thread(&td);
@@ -339,7 +363,13 @@ spdk_init_thread_poll(void *arg)
 		pthread_mutex_lock(&g_init_mtx);
 		if (!TAILQ_EMPTY(&g_threads)) {
 			TAILQ_FOREACH_SAFE(thread, &g_threads, link, tmp) {
-				spdk_fio_poll_thread(thread);
+				if (spdk_thread_is_exited(thread->thread)) {
+					TAILQ_REMOVE(&g_threads, thread, link);
+					free(thread->iocq);
+					spdk_thread_destroy(thread->thread);
+				} else {
+					spdk_fio_poll_thread(thread);
+				}
 			}
 
 			/* If there are exiting threads to poll, don't sleep. */
@@ -387,9 +417,8 @@ spdk_init_thread_poll(void *arg)
 		TAILQ_FOREACH_SAFE(thread, &g_threads, link, tmp) {
 			if (spdk_thread_is_exited(thread->thread)) {
 				TAILQ_REMOVE(&g_threads, thread, link);
-				spdk_thread_destroy(thread->thread);
 				free(thread->iocq);
-				free(thread);
+				spdk_thread_destroy(thread->thread);
 			} else {
 				spdk_thread_poll(thread->thread, 0, 0);
 			}
@@ -1241,6 +1270,15 @@ static struct fio_option options[] = {
 		.help		= "Use zone append instead of write (1=zone append, 0=write)",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name           = "env_context",
+		.lname          = "Environment context options",
+		.type           = FIO_OPT_STR_STORE,
+		.off1           = offsetof(struct spdk_fio_options, env_context),
+		.help           = "Opaque context for use of the env implementation",
+		.category       = FIO_OPT_C_ENGINE,
+		.group          = FIO_OPT_G_INVALID,
 	},
 	{
 		.name		= NULL,

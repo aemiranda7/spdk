@@ -3,6 +3,7 @@
  *
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
+ *   Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -39,6 +40,7 @@
 #include "spdk/bit_array.h"
 #include "spdk/util.h"
 #include "spdk/log.h"
+#include "spdk/memory.h"
 
 #include "libpmem.h"
 
@@ -126,6 +128,7 @@ struct spdk_reduce_vol_request {
 	int					num_backing_ops;
 	uint32_t				num_io_units;
 	bool					chunk_is_compressed;
+	bool					copy_after_decompress;
 	uint64_t				offset;
 	uint64_t				logical_map_index;
 	uint64_t				length;
@@ -332,17 +335,67 @@ struct reduce_init_load_ctx {
 	void					*path;
 };
 
+static inline bool
+_addr_crosses_huge_page(const void *addr, size_t *size)
+{
+	size_t _size;
+	uint64_t rc;
+
+	assert(size);
+
+	_size = *size;
+	rc = spdk_vtophys(addr, size);
+
+	return rc == SPDK_VTOPHYS_ERROR || _size != *size;
+}
+
+static inline int
+_set_buffer(uint8_t **vol_buffer, uint8_t **_addr, uint8_t *addr_range, size_t buffer_size)
+{
+	uint8_t *addr;
+	size_t size_tmp = buffer_size;
+
+	addr = *_addr;
+
+	/* Verify that addr + buffer_size doesn't cross huge page boundary */
+	if (_addr_crosses_huge_page(addr, &size_tmp)) {
+		/* Memory start is aligned on 2MiB, so buffer should be located at the end of the page.
+		 * Skip remaining bytes and continue from the beginning of the next page */
+		addr += size_tmp;
+	}
+
+	if (addr + buffer_size > addr_range) {
+		SPDK_ERRLOG("Vol buffer %p out of range %p\n", addr, addr_range);
+		return -ERANGE;
+	}
+
+	*vol_buffer = addr;
+	*_addr = addr + buffer_size;
+
+	return 0;
+}
+
 static int
 _allocate_vol_requests(struct spdk_reduce_vol *vol)
 {
 	struct spdk_reduce_vol_request *req;
-	int i;
+	uint32_t reqs_in_2mb_page, huge_pages_needed;
+	uint8_t *buffer, *buffer_end;
+	int i = 0;
+	int rc = 0;
 
-	/* Allocate 2x since we need buffers for both read/write and compress/decompress
-	 *  intermediate buffers.
-	 */
-	vol->buf_mem = spdk_malloc(2 * REDUCE_NUM_VOL_REQUESTS * vol->params.chunk_size,
-				   64, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	/* It is needed to allocate comp and decomp buffers so that they do not cross physical
+	* page boundaries. Assume that the system uses default 2MiB pages and chunk_size is not
+	* necessarily power of 2
+	* Allocate 2x since we need buffers for both read/write and compress/decompress
+	* intermediate buffers. */
+	reqs_in_2mb_page = VALUE_2MB / (vol->params.chunk_size * 2);
+	if (!reqs_in_2mb_page) {
+		return -EINVAL;
+	}
+	huge_pages_needed = SPDK_CEIL_DIV(REDUCE_NUM_VOL_REQUESTS, reqs_in_2mb_page);
+
+	vol->buf_mem = spdk_dma_malloc(VALUE_2MB * huge_pages_needed, VALUE_2MB, NULL);
 	if (vol->buf_mem == NULL) {
 		return -ENOMEM;
 	}
@@ -367,16 +420,39 @@ _allocate_vol_requests(struct spdk_reduce_vol *vol)
 		return -ENOMEM;
 	}
 
+	buffer = vol->buf_mem;
+	buffer_end = buffer + VALUE_2MB * huge_pages_needed;
+
 	for (i = 0; i < REDUCE_NUM_VOL_REQUESTS; i++) {
 		req = &vol->request_mem[i];
 		TAILQ_INSERT_HEAD(&vol->free_requests, req, tailq);
 		req->decomp_buf_iov = &vol->buf_iov_mem[(2 * i) * vol->backing_io_units_per_chunk];
-		req->decomp_buf = vol->buf_mem + (2 * i) * vol->params.chunk_size;
 		req->comp_buf_iov = &vol->buf_iov_mem[(2 * i + 1) * vol->backing_io_units_per_chunk];
-		req->comp_buf = vol->buf_mem + (2 * i + 1) * vol->params.chunk_size;
+
+		rc = _set_buffer(&req->comp_buf, &buffer, buffer_end, vol->params.chunk_size);
+		if (rc) {
+			SPDK_ERRLOG("Failed to set comp buffer for req idx %u, addr %p, start %p, end %p\n", i, buffer,
+				    vol->buf_mem, buffer_end);
+			break;
+		}
+		rc = _set_buffer(&req->decomp_buf, &buffer, buffer_end, vol->params.chunk_size);
+		if (rc) {
+			SPDK_ERRLOG("Failed to set decomp buffer for req idx %u, addr %p, start %p, end %p\n", i, buffer,
+				    vol->buf_mem, buffer_end);
+			break;
+		}
 	}
 
-	return 0;
+	if (rc) {
+		free(vol->buf_iov_mem);
+		free(vol->request_mem);
+		spdk_free(vol->buf_mem);
+		vol->buf_mem = NULL;
+		vol->buf_iov_mem = NULL;
+		vol->request_mem = NULL;
+	}
+
+	return rc;
 }
 
 static void
@@ -1148,7 +1224,7 @@ _reduce_vol_compress_chunk(struct spdk_reduce_vol_request *req, reduce_request_f
 	req->comp_buf_iov[0].iov_base = req->comp_buf;
 	req->comp_buf_iov[0].iov_len = vol->params.chunk_size;
 	vol->backing_dev->compress(vol->backing_dev,
-				   &req->decomp_iov[0], req->decomp_iovcnt, req->comp_buf_iov, 1,
+				   req->decomp_iov, req->decomp_iovcnt, req->comp_buf_iov, 1,
 				   &req->backing_cb_args);
 }
 
@@ -1174,10 +1250,27 @@ _reduce_vol_decompress_chunk(struct spdk_reduce_vol_request *req, reduce_request
 	struct spdk_reduce_vol *vol = req->vol;
 	uint64_t chunk_offset, remainder = 0;
 	uint64_t ttl_len = 0;
+	size_t iov_len;
 	int i;
 
 	req->decomp_iovcnt = 0;
 	chunk_offset = req->offset % vol->logical_blocks_per_chunk;
+
+	/* If backing device doesn't support SGL output then we should copy the result of decompression to user's buffer
+	 * if at least one of the conditions below is true:
+	 * 1. User's buffer is fragmented
+	 * 2. Length of the user's buffer is less than the chunk
+	 * 3. User's buffer is contig, equals chunk_size but crosses huge page boundary */
+	iov_len = req->iov[0].iov_len;
+	req->copy_after_decompress = !vol->backing_dev->sgl_out && (req->iovcnt > 1 ||
+				     req->iov[0].iov_len < vol->params.chunk_size ||
+				     _addr_crosses_huge_page(req->iov[0].iov_base, &iov_len));
+	if (req->copy_after_decompress) {
+		req->decomp_iov[0].iov_base = req->decomp_buf;
+		req->decomp_iov[0].iov_len = vol->params.chunk_size;
+		req->decomp_iovcnt = 1;
+		goto decompress;
+	}
 
 	if (chunk_offset) {
 		/* first iov point to our scratch buffer for any offset into the chunk */
@@ -1205,22 +1298,121 @@ _reduce_vol_decompress_chunk(struct spdk_reduce_vol_request *req, reduce_request
 	}
 	assert(ttl_len == vol->params.chunk_size);
 
+decompress:
+	assert(!req->copy_after_decompress || (req->copy_after_decompress && req->decomp_iovcnt == 1));
 	req->backing_cb_args.cb_fn = next_fn;
 	req->backing_cb_args.cb_arg = req;
 	req->comp_buf_iov[0].iov_base = req->comp_buf;
 	req->comp_buf_iov[0].iov_len = req->chunk->compressed_size;
 	vol->backing_dev->decompress(vol->backing_dev,
-				     req->comp_buf_iov, 1, &req->decomp_iov[0], req->decomp_iovcnt,
+				     req->comp_buf_iov, 1, req->decomp_iov, req->decomp_iovcnt,
 				     &req->backing_cb_args);
+}
+
+static inline void
+_prepare_compress_chunk_copy_user_buffers(struct spdk_reduce_vol_request *req, bool zero_paddings)
+{
+	struct spdk_reduce_vol *vol = req->vol;
+	char *padding_buffer = zero_paddings ? g_zero_buf : req->decomp_buf;
+	uint64_t chunk_offset, ttl_len = 0;
+	uint64_t remainder = 0;
+	char *copy_offset = NULL;
+	uint32_t lbsize = vol->params.logical_block_size;
+	int i;
+
+	req->decomp_iov[0].iov_base = req->decomp_buf;
+	req->decomp_iov[0].iov_len = vol->params.chunk_size;
+	req->decomp_iovcnt = 1;
+	copy_offset = req->decomp_iov[0].iov_base;
+	chunk_offset = req->offset % vol->logical_blocks_per_chunk;
+
+	if (chunk_offset) {
+		ttl_len += chunk_offset * lbsize;
+		/* copy_offset already points to padding buffer if zero_paddings=false */
+		if (zero_paddings) {
+			memcpy(copy_offset, padding_buffer, ttl_len);
+		}
+		copy_offset += ttl_len;
+	}
+
+	/* now the user data iov, direct from the user buffer */
+	for (i = 0; i < req->iovcnt; i++) {
+		memcpy(copy_offset, req->iov[i].iov_base, req->iov[i].iov_len);
+		copy_offset += req->iov[i].iov_len;
+		ttl_len += req->iov[i].iov_len;
+	}
+
+	remainder = vol->params.chunk_size - ttl_len;
+	if (remainder) {
+		/* copy_offset already points to padding buffer if zero_paddings=false */
+		if (zero_paddings) {
+			memcpy(copy_offset, padding_buffer + ttl_len, remainder);
+		}
+		ttl_len += remainder;
+	}
+
+	assert(ttl_len == req->vol->params.chunk_size);
+}
+
+/* This function can be called when we are compressing a new data or in case of read-modify-write
+ * In the first case possible paddings should be filled with zeroes, in the second case the paddings
+ * should point to already read and decompressed buffer */
+static inline void
+_prepare_compress_chunk(struct spdk_reduce_vol_request *req, bool zero_paddings)
+{
+	struct spdk_reduce_vol *vol = req->vol;
+	char *padding_buffer = zero_paddings ? g_zero_buf : req->decomp_buf;
+	uint64_t chunk_offset, ttl_len = 0;
+	uint64_t remainder = 0;
+	uint32_t lbsize = vol->params.logical_block_size;
+	size_t iov_len;
+	int i;
+
+	/* If backing device doesn't support SGL input then we should copy user's buffer into decomp_buf
+	 * if at least one of the conditions below is true:
+	 * 1. User's buffer is fragmented
+	 * 2. Length of the user's buffer is less than the chunk
+	 * 3. User's buffer is contig, equals chunk_size but crosses huge page boundary */
+	iov_len = req->iov[0].iov_len;
+	if (!vol->backing_dev->sgl_in && (req->iovcnt > 1 ||
+					  req->iov[0].iov_len < vol->params.chunk_size ||
+					  _addr_crosses_huge_page(req->iov[0].iov_base, &iov_len))) {
+		_prepare_compress_chunk_copy_user_buffers(req, zero_paddings);
+		return;
+	}
+
+	req->decomp_iovcnt = 0;
+	chunk_offset = req->offset % vol->logical_blocks_per_chunk;
+
+	if (chunk_offset != 0) {
+		ttl_len += chunk_offset * lbsize;
+		req->decomp_iov[0].iov_base = padding_buffer;
+		req->decomp_iov[0].iov_len = ttl_len;
+		req->decomp_iovcnt = 1;
+	}
+
+	/* now the user data iov, direct from the user buffer */
+	for (i = 0; i < req->iovcnt; i++) {
+		req->decomp_iov[i + req->decomp_iovcnt].iov_base = req->iov[i].iov_base;
+		req->decomp_iov[i + req->decomp_iovcnt].iov_len = req->iov[i].iov_len;
+		ttl_len += req->iov[i].iov_len;
+	}
+	req->decomp_iovcnt += req->iovcnt;
+
+	remainder = vol->params.chunk_size - ttl_len;
+	if (remainder) {
+		req->decomp_iov[req->decomp_iovcnt].iov_base = padding_buffer + ttl_len;
+		req->decomp_iov[req->decomp_iovcnt].iov_len = remainder;
+		req->decomp_iovcnt++;
+		ttl_len += remainder;
+	}
+	assert(ttl_len == req->vol->params.chunk_size);
 }
 
 static void
 _write_decompress_done(void *_req, int reduce_errno)
 {
 	struct spdk_reduce_vol_request *req = _req;
-	struct spdk_reduce_vol *vol = req->vol;
-	uint64_t chunk_offset, remainder, ttl_len = 0;
-	int i;
 
 	/* Negative reduce_errno indicates failure for compression operations. */
 	if (reduce_errno < 0) {
@@ -1232,37 +1424,12 @@ _write_decompress_done(void *_req, int reduce_errno)
 	 *  buffer.  This should equal the chunk size - otherwise that's another
 	 *  type of failure.
 	 */
-	if ((uint32_t)reduce_errno != vol->params.chunk_size) {
+	if ((uint32_t)reduce_errno != req->vol->params.chunk_size) {
 		_reduce_vol_complete_req(req, -EIO);
 		return;
 	}
 
-	req->decomp_iovcnt = 0;
-	chunk_offset = req->offset % vol->logical_blocks_per_chunk;
-
-	if (chunk_offset) {
-		req->decomp_iov[0].iov_base = req->decomp_buf;
-		req->decomp_iov[0].iov_len = chunk_offset * vol->params.logical_block_size;
-		ttl_len += req->decomp_iov[0].iov_len;
-		req->decomp_iovcnt = 1;
-	}
-
-	for (i = 0; i < req->iovcnt; i++) {
-		req->decomp_iov[i + req->decomp_iovcnt].iov_base = req->iov[i].iov_base;
-		req->decomp_iov[i + req->decomp_iovcnt].iov_len = req->iov[i].iov_len;
-		ttl_len += req->decomp_iov[i + req->decomp_iovcnt].iov_len;
-	}
-	req->decomp_iovcnt += req->iovcnt;
-
-	remainder = vol->params.chunk_size - ttl_len;
-	if (remainder) {
-		req->decomp_iov[req->decomp_iovcnt].iov_base = req->decomp_buf + ttl_len;
-		req->decomp_iov[req->decomp_iovcnt].iov_len = remainder;
-		ttl_len += req->decomp_iov[req->decomp_iovcnt].iov_len;
-		req->decomp_iovcnt++;
-	}
-	assert(ttl_len == vol->params.chunk_size);
-
+	_prepare_compress_chunk(req, false);
 	_reduce_vol_compress_chunk(req, _write_compress_done);
 }
 
@@ -1311,6 +1478,18 @@ _read_decompress_done(void *_req, int reduce_errno)
 	if ((uint32_t)reduce_errno != vol->params.chunk_size) {
 		_reduce_vol_complete_req(req, -EIO);
 		return;
+	}
+
+	if (req->copy_after_decompress) {
+		uint64_t chunk_offset = req->offset % vol->logical_blocks_per_chunk;
+		char *decomp_buffer = (char *)req->decomp_buf + chunk_offset * vol->params.logical_block_size;
+		int i;
+
+		for (i = 0; i < req->iovcnt; i++) {
+			memcpy(req->iov[i].iov_base, decomp_buffer, req->iov[i].iov_len);
+			decomp_buffer += req->iov[i].iov_len;
+			assert(decomp_buffer <= (char *)req->decomp_buf + vol->params.chunk_size);
+		}
 	}
 
 	_reduce_vol_complete_req(req, 0);
@@ -1466,6 +1645,7 @@ spdk_reduce_vol_readv(struct spdk_reduce_vol *vol,
 	req->offset = offset;
 	req->logical_map_index = logical_map_index;
 	req->length = length;
+	req->copy_after_decompress = false;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
@@ -1480,10 +1660,6 @@ static void
 _start_writev_request(struct spdk_reduce_vol_request *req)
 {
 	struct spdk_reduce_vol *vol = req->vol;
-	uint64_t chunk_offset, ttl_len = 0;
-	uint64_t remainder = 0;
-	uint32_t lbsize;
-	int i;
 
 	TAILQ_INSERT_TAIL(&req->vol->executing_requests, req, tailq);
 	if (vol->pm_logical_map[req->logical_map_index] != REDUCE_EMPTY_MAP_ENTRY) {
@@ -1497,36 +1673,9 @@ _start_writev_request(struct spdk_reduce_vol_request *req)
 		}
 	}
 
-	lbsize = vol->params.logical_block_size;
-	req->decomp_iovcnt = 0;
 	req->rmw = false;
 
-	/* Note: point to our zero buf for offset into the chunk. */
-	chunk_offset = req->offset % vol->logical_blocks_per_chunk;
-	if (chunk_offset != 0) {
-		ttl_len += chunk_offset * lbsize;
-		req->decomp_iov[0].iov_base = g_zero_buf;
-		req->decomp_iov[0].iov_len = ttl_len;
-		req->decomp_iovcnt = 1;
-	}
-
-	/* now the user data iov, direct from the user buffer */
-	for (i = 0; i < req->iovcnt; i++) {
-		req->decomp_iov[i + req->decomp_iovcnt].iov_base = req->iov[i].iov_base;
-		req->decomp_iov[i + req->decomp_iovcnt].iov_len = req->iov[i].iov_len;
-		ttl_len += req->decomp_iov[i + req->decomp_iovcnt].iov_len;
-	}
-	req->decomp_iovcnt += req->iovcnt;
-
-	remainder = vol->params.chunk_size - ttl_len;
-	if (remainder) {
-		req->decomp_iov[req->decomp_iovcnt].iov_base = g_zero_buf;
-		req->decomp_iov[req->decomp_iovcnt].iov_len = remainder;
-		ttl_len += req->decomp_iov[req->decomp_iovcnt].iov_len;
-		req->decomp_iovcnt++;
-	}
-	assert(ttl_len == req->vol->params.chunk_size);
-
+	_prepare_compress_chunk(req, true);
 	_reduce_vol_compress_chunk(req, _write_compress_done);
 }
 
@@ -1571,6 +1720,7 @@ spdk_reduce_vol_writev(struct spdk_reduce_vol *vol,
 	req->offset = offset;
 	req->logical_map_index = logical_map_index;
 	req->length = length;
+	req->copy_after_decompress = false;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 

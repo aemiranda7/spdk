@@ -3,6 +3,8 @@
  *
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
+ *   Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.
+ *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -59,7 +61,7 @@ static int g_mbuf_offset;
  * Note that the string names are defined by the DPDK PMD in question so be
  * sure to use the exact names.
  */
-#define MAX_NUM_DRV_TYPES 2
+#define MAX_NUM_DRV_TYPES 3
 
 /* The VF spread is the number of queue pairs between virtual functions, we use this to
  * load balance the QAT device.
@@ -68,7 +70,7 @@ static int g_mbuf_offset;
 static uint8_t g_qat_total_qp = 0;
 static uint8_t g_next_qat_index;
 
-const char *g_driver_names[MAX_NUM_DRV_TYPES] = { AESNI_MB, QAT };
+const char *g_driver_names[MAX_NUM_DRV_TYPES] = { AESNI_MB, QAT, MLX5 };
 
 /* Global list of available crypto devices. */
 struct vbdev_dev {
@@ -91,6 +93,7 @@ struct device_qp {
 };
 static TAILQ_HEAD(, device_qp) g_device_qp_qat = TAILQ_HEAD_INITIALIZER(g_device_qp_qat);
 static TAILQ_HEAD(, device_qp) g_device_qp_aesni_mb = TAILQ_HEAD_INITIALIZER(g_device_qp_aesni_mb);
+static TAILQ_HEAD(, device_qp) g_device_qp_mlx5 = TAILQ_HEAD_INITIALIZER(g_device_qp_mlx5);
 static pthread_mutex_t g_device_qp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -135,16 +138,20 @@ uint8_t g_number_of_claimed_volumes = 0;
  */
 #define CRYPTO_QP_DESCRIPTORS	2048
 
-/* Specific to AES_CBC. */
-#define AES_CBC_IV_LENGTH	16
-#define AES_CBC_KEY_LENGTH	16
-#define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
+/* At this moment DPDK descriptors allocation for mlx5 has some issues. We use 512
+ * as an compromise value between performance and the time spent for initialization. */
+#define CRYPTO_QP_DESCRIPTORS_MLX5	512
+
 #define AESNI_MB_NUM_QP		64
 
 /* Common for suported devices. */
-#define IV_OFFSET            (sizeof(struct rte_crypto_op) + \
-				sizeof(struct rte_crypto_sym_op))
-#define QUEUED_OP_OFFSET (IV_OFFSET + AES_CBC_IV_LENGTH)
+#define DEFAULT_NUM_XFORMS           2
+#define IV_OFFSET (sizeof(struct rte_crypto_op) + \
+                sizeof(struct rte_crypto_sym_op) + \
+                (DEFAULT_NUM_XFORMS * \
+                 sizeof(struct rte_crypto_sym_xform)))
+#define IV_LENGTH		     16
+#define QUEUED_OP_OFFSET (IV_OFFSET + IV_LENGTH)
 
 static void _complete_internal_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
@@ -153,40 +160,30 @@ static void vbdev_crypto_examine(struct spdk_bdev *bdev);
 static int vbdev_crypto_claim(const char *bdev_name);
 static void vbdev_crypto_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 
-/* List of crypto_bdev names and their base bdevs via configuration file. */
 struct bdev_names {
-	char			*vbdev_name;	/* name of the vbdev to create */
-	char			*bdev_name;	/* base bdev name */
-
-	/* Note, for dev/test we allow use of key in the config file, for production
-	 * use, you must use an RPC to specify the key for security reasons.
-	 */
-	uint8_t			*key;		/* key per bdev */
-	char			*drv_name;	/* name of the crypto device driver */
-	char			*cipher;	/* AES_CBC or AES_XTS */
-	uint8_t			*key2;		/* key #2 for AES_XTS, per bdev */
-	TAILQ_ENTRY(bdev_names)	link;
+	struct vbdev_crypto_opts	*opts;
+	TAILQ_ENTRY(bdev_names)		link;
 };
+
+/* List of crypto_bdev names and their base bdevs via configuration file. */
 static TAILQ_HEAD(, bdev_names) g_bdev_names = TAILQ_HEAD_INITIALIZER(g_bdev_names);
 
-/* List of virtual bdevs and associated info for each. We keep the device friendly name here even
- * though its also in the device struct because we use it early on.
- */
 struct vbdev_crypto {
 	struct spdk_bdev		*base_bdev;		/* the thing we're attaching to */
 	struct spdk_bdev_desc		*base_desc;		/* its descriptor we get from open */
 	struct spdk_bdev		crypto_bdev;		/* the crypto virtual bdev */
-	uint8_t				*key;			/* key per bdev */
-	uint8_t				*key2;			/* for XTS */
-	uint8_t				*xts_key;		/* key + key 2 */
-	char				*drv_name;		/* name of the crypto device driver */
-	char				*cipher;		/* cipher used */
+	struct vbdev_crypto_opts	*opts;			/* crypto options such as key, cipher */
+	uint32_t			qp_desc_nr;             /* number of qp descriptors */
 	struct rte_cryptodev_sym_session *session_encrypt;	/* encryption session for this bdev */
 	struct rte_cryptodev_sym_session *session_decrypt;	/* decryption session for this bdev */
 	struct rte_crypto_sym_xform	cipher_xform;		/* crypto control struct for this bdev */
 	TAILQ_ENTRY(vbdev_crypto)	link;
 	struct spdk_thread		*thread;		/* thread where base device is opened */
 };
+
+/* List of virtual bdevs and associated info for each. We keep the device friendly name here even
+ * though its also in the device struct because we use it early on.
+ */
 static TAILQ_HEAD(, vbdev_crypto) g_vbdev_crypto = TAILQ_HEAD_INITIALIZER(g_vbdev_crypto);
 
 /* Shared mempools between all devices on this system */
@@ -250,6 +247,7 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 	uint8_t j, cdev_id, cdrv_id;
 	struct device_qp *dev_qp;
 	struct device_qp *tmp_qp;
+	uint32_t qp_desc_nr;
 	int rc;
 	TAILQ_HEAD(device_qps, device_qp) *dev_qp_head;
 
@@ -290,13 +288,33 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 
 	rc = rte_cryptodev_configure(cdev_id, &conf);
 	if (rc < 0) {
-		SPDK_ERRLOG("Failed to configure cryptodev %u\n", cdev_id);
+		SPDK_ERRLOG("Failed to configure cryptodev %u: error %d\n",
+			    cdev_id, rc);
 		rc = -EINVAL;
 		goto err;
 	}
 
+	/* Select the right device/qp list based on driver name
+	 * or error if it does not exist.
+	 */
+	if (strcmp(device->cdev_info.driver_name, QAT) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_qat;
+		qp_desc_nr = CRYPTO_QP_DESCRIPTORS;
+	} else if (strcmp(device->cdev_info.driver_name, AESNI_MB) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_aesni_mb;
+		qp_desc_nr = CRYPTO_QP_DESCRIPTORS;
+	} else if (strcmp(device->cdev_info.driver_name, MLX5) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_mlx5;
+		qp_desc_nr = CRYPTO_QP_DESCRIPTORS_MLX5;
+	} else {
+		SPDK_ERRLOG("Failed to start device %u. Invalid driver name \"%s\"\n",
+			    cdev_id, device->cdev_info.driver_name);
+		rc = -EINVAL;
+		goto err_qp_setup;
+	}
+
 	struct rte_cryptodev_qp_conf qp_conf = {
-		.nb_descriptors = CRYPTO_QP_DESCRIPTORS,
+		.nb_descriptors = qp_desc_nr,
 		.mp_session = g_session_mp,
 		.mp_session_private = g_session_mp_priv,
 	};
@@ -310,7 +328,7 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 		rc = rte_cryptodev_queue_pair_setup(cdev_id, j, &qp_conf, SOCKET_ID_ANY);
 		if (rc < 0) {
 			SPDK_ERRLOG("Failed to setup queue pair %u on "
-				    "cryptodev %u\n", j, cdev_id);
+				    "cryptodev %u: error %d\n", j, cdev_id, rc);
 			rc = -EINVAL;
 			goto err_qp_setup;
 		}
@@ -322,20 +340,6 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 			    cdev_id, rc);
 		rc = -EINVAL;
 		goto err_dev_start;
-	}
-
-	/* Select the right device/qp list based on driver name
-	 * or error if it does not exist.
-	 */
-	if (strcmp(device->cdev_info.driver_name, QAT) == 0) {
-		dev_qp_head = (struct device_qps *)&g_device_qp_qat;
-	} else if (strcmp(device->cdev_info.driver_name, AESNI_MB) == 0) {
-		dev_qp_head = (struct device_qps *)&g_device_qp_aesni_mb;
-	} else {
-		SPDK_ERRLOG("Failed to start device %u. Invalid driver name \"%s\"\n",
-			    cdev_id, device->cdev_info.driver_name);
-		rc = -EINVAL;
-		goto err_invalid_drv_name;
 	}
 
 	/* Build up lists of device/qp combinations per PMD */
@@ -369,7 +373,6 @@ err_qp_alloc:
 		}
 		free(dev_qp);
 	}
-err_invalid_drv_name:
 	rte_cryptodev_stop(cdev_id);
 err_dev_start:
 err_qp_setup:
@@ -394,6 +397,8 @@ release_vbdev_dev(struct vbdev_dev *device)
 		dev_qp_head = (struct device_qps *)&g_device_qp_qat;
 	} else if (strcmp(device->cdev_info.driver_name, AESNI_MB) == 0) {
 		dev_qp_head = (struct device_qps *)&g_device_qp_aesni_mb;
+	} else if (strcmp(device->cdev_info.driver_name, MLX5) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_mlx5;
 	}
 	if (dev_qp_head) {
 		TAILQ_FOREACH_SAFE(dev_qp, dev_qp_head, link, tmp_qp) {
@@ -453,6 +458,7 @@ vbdev_crypto_init_crypto_drivers(void)
 
 	/* If we have no crypto devices, there's no reason to continue. */
 	cdev_count = rte_cryptodev_count();
+	SPDK_NOTICELOG("Found crypto devices: %d\n", (int)cdev_count);
 	if (cdev_count == 0) {
 		return 0;
 	}
@@ -503,14 +509,16 @@ vbdev_crypto_init_crypto_drivers(void)
 		goto error_create_mbuf;
 	}
 
-	/* We use per op private data to store the IV and our own struct
-	 * for queueing ops.
+	/* We use per op private data as suggested by DPDK and to store the IV and
+	 * our own struct for queueing ops.
 	 */
 	g_crypto_op_mp = rte_crypto_op_pool_create("op_mp",
 			 RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 			 NUM_MBUFS,
 			 POOL_CACHE_SIZE,
-			 AES_CBC_IV_LENGTH + QUEUED_OP_LENGTH,
+			 (DEFAULT_NUM_XFORMS *
+			  sizeof(struct rte_crypto_sym_xform)) +
+			 IV_LENGTH + QUEUED_OP_LENGTH,
 			 rte_socket_id());
 
 	if (g_crypto_op_mp == NULL) {
@@ -883,7 +891,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	 */
 	rc = rte_pktmbuf_alloc_bulk(g_mbuf_mp, src_mbufs, cryop_cnt);
 	if (rc) {
-		SPDK_ERRLOG("ERROR trying to get src_mbufs!\n");
+		SPDK_ERRLOG("Failed to get src_mbufs!\n");
 		return -ENOMEM;
 	}
 
@@ -891,7 +899,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
 		rc = rte_pktmbuf_alloc_bulk(g_mbuf_mp, dst_mbufs, cryop_cnt);
 		if (rc) {
-			SPDK_ERRLOG("ERROR trying to get dst_mbufs!\n");
+			SPDK_ERRLOG("Failed to get dst_mbufs!\n");
 			rc = -ENOMEM;
 			goto error_get_dst;
 		}
@@ -906,7 +914,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 					     RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 					     crypto_ops, cryop_cnt);
 	if (allocated < cryop_cnt) {
-		SPDK_ERRLOG("ERROR trying to get crypto ops!\n");
+		SPDK_ERRLOG("Failed to allocate crypto ops!\n");
 		rc = -ENOMEM;
 		goto error_get_ops;
 	}
@@ -966,7 +974,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 		/* Set the IV - we use the LBA of the crypto_op */
 		iv_ptr = rte_crypto_op_ctod_offset(crypto_ops[crypto_index], uint8_t *,
 						   IV_OFFSET);
-		memset(iv_ptr, 0, AES_CBC_IV_LENGTH);
+		memset(iv_ptr, 0, IV_LENGTH);
 		op_block_offset = bdev_io->u.bdev.offset_blocks + crypto_index;
 		rte_memcpy(iv_ptr, &op_block_offset, sizeof(uint64_t));
 
@@ -1044,7 +1052,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	/* Enqueue everything we've got but limit by the max number of descriptors we
 	 * configured the crypto device for.
 	 */
-	burst = spdk_min(cryop_cnt, CRYPTO_QP_DESCRIPTORS);
+	burst = spdk_min(cryop_cnt, io_ctx->crypto_bdev->qp_desc_nr);
 	num_enqueued_ops = rte_cryptodev_enqueue_burst(cdev_id, crypto_ch->device_qp->qp,
 			   &crypto_ops[0],
 			   burst);
@@ -1193,10 +1201,10 @@ _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		if (!_crypto_operation(orig_io, RTE_CRYPTO_CIPHER_OP_DECRYPT, NULL)) {
 			return;
 		} else {
-			SPDK_ERRLOG("ERROR decrypting\n");
+			SPDK_ERRLOG("Failed to decrypt!\n");
 		}
 	} else {
-		SPDK_ERRLOG("ERROR on read prior to decrypting\n");
+		SPDK_ERRLOG("Failed to read prior to decrypting!\n");
 	}
 
 	spdk_bdev_io_complete(orig_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -1258,7 +1266,7 @@ crypto_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 			io_ctx->ch = ch;
 			vbdev_crypto_queue_io(bdev_io);
 		} else {
-			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			SPDK_ERRLOG("Failed to submit bdev_io!\n");
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 	}
@@ -1283,7 +1291,7 @@ crypto_write_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io
 			io_ctx->ch = ch;
 			vbdev_crypto_queue_io(bdev_io);
 		} else {
-			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			SPDK_ERRLOG("Failed to submit bdev_io!\n");
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 	}
@@ -1351,7 +1359,7 @@ vbdev_crypto_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 			io_ctx->ch = ch;
 			vbdev_crypto_queue_io(bdev_io);
 		} else {
-			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			SPDK_ERRLOG("Failed to submit bdev_io!\n");
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
 	}
@@ -1391,19 +1399,7 @@ _device_unregister_cb(void *io_device)
 	/* Done with this crypto_bdev. */
 	rte_cryptodev_sym_session_free(crypto_bdev->session_decrypt);
 	rte_cryptodev_sym_session_free(crypto_bdev->session_encrypt);
-	free(crypto_bdev->drv_name);
-	if (crypto_bdev->key) {
-		memset(crypto_bdev->key, 0, strnlen(crypto_bdev->key, (AES_CBC_KEY_LENGTH + 1)));
-		free(crypto_bdev->key);
-	}
-	if (crypto_bdev->key2) {
-		memset(crypto_bdev->key2, 0, strnlen(crypto_bdev->key2, (AES_XTS_KEY_LENGTH + 1)));
-		free(crypto_bdev->key2);
-	}
-	if (crypto_bdev->xts_key) {
-		memset(crypto_bdev->xts_key, 0, strnlen(crypto_bdev->xts_key, (AES_XTS_KEY_LENGTH * 2) + 1));
-		free(crypto_bdev->xts_key);
-	}
+	crypto_bdev->opts = NULL;
 	free(crypto_bdev->crypto_bdev.name);
 	free(crypto_bdev);
 }
@@ -1471,19 +1467,45 @@ static int
 vbdev_crypto_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct vbdev_crypto *crypto_bdev = (struct vbdev_crypto *)ctx;
+	char *hexkey = NULL, *hexkey2 = NULL;
+	int rc = 0;
+
+	hexkey = hexlify(crypto_bdev->opts->key,
+			 crypto_bdev->opts->key_size);
+	if (!hexkey) {
+		return -ENOMEM;
+	}
+
+	if (crypto_bdev->opts->key2) {
+		hexkey2 = hexlify(crypto_bdev->opts->key2,
+				  crypto_bdev->opts->key2_size);
+		if (!hexkey2) {
+			rc = -ENOMEM;
+			goto out_err;
+		}
+	}
 
 	spdk_json_write_name(w, "crypto");
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(crypto_bdev->base_bdev));
 	spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&crypto_bdev->crypto_bdev));
-	spdk_json_write_named_string(w, "crypto_pmd", crypto_bdev->drv_name);
-	spdk_json_write_named_string(w, "key", crypto_bdev->key);
-	if (strcmp(crypto_bdev->cipher, AES_XTS) == 0) {
-		spdk_json_write_named_string(w, "key2", crypto_bdev->key2);
+	spdk_json_write_named_string(w, "crypto_pmd", crypto_bdev->opts->drv_name);
+	spdk_json_write_named_string(w, "key", hexkey);
+	if (hexkey2) {
+		spdk_json_write_named_string(w, "key2", hexkey2);
 	}
-	spdk_json_write_named_string(w, "cipher", crypto_bdev->cipher);
+	spdk_json_write_named_string(w, "cipher", crypto_bdev->opts->cipher);
 	spdk_json_write_object_end(w);
-	return 0;
+out_err:
+	if (hexkey) {
+		memset(hexkey, 0, strlen(hexkey));
+		free(hexkey);
+	}
+	if (hexkey2) {
+		memset(hexkey2, 0, strlen(hexkey2));
+		free(hexkey2);
+	}
+	return rc;
 }
 
 static int
@@ -1492,19 +1514,46 @@ vbdev_crypto_config_json(struct spdk_json_write_ctx *w)
 	struct vbdev_crypto *crypto_bdev;
 
 	TAILQ_FOREACH(crypto_bdev, &g_vbdev_crypto, link) {
+		char *hexkey = NULL, *hexkey2 = NULL;
+
+		hexkey = hexlify(crypto_bdev->opts->key,
+				 crypto_bdev->opts->key_size);
+		if (!hexkey) {
+			return -ENOMEM;
+		}
+
+		if (crypto_bdev->opts->key2) {
+			hexkey2 = hexlify(crypto_bdev->opts->key2,
+					  crypto_bdev->opts->key2_size);
+			if (!hexkey2) {
+				memset(hexkey, 0, strlen(hexkey));
+				free(hexkey);
+				return -ENOMEM;
+			}
+		}
+
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_string(w, "method", "bdev_crypto_create");
 		spdk_json_write_named_object_begin(w, "params");
 		spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(crypto_bdev->base_bdev));
 		spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&crypto_bdev->crypto_bdev));
-		spdk_json_write_named_string(w, "crypto_pmd", crypto_bdev->drv_name);
-		spdk_json_write_named_string(w, "key", crypto_bdev->key);
-		if (strcmp(crypto_bdev->cipher, AES_XTS) == 0) {
-			spdk_json_write_named_string(w, "key2", crypto_bdev->key2);
+		spdk_json_write_named_string(w, "crypto_pmd", crypto_bdev->opts->drv_name);
+		spdk_json_write_named_string(w, "key", hexkey);
+		if (hexkey2) {
+			spdk_json_write_named_string(w, "key2", hexkey2);
 		}
-		spdk_json_write_named_string(w, "cipher", crypto_bdev->cipher);
+		spdk_json_write_named_string(w, "cipher", crypto_bdev->opts->cipher);
 		spdk_json_write_object_end(w);
 		spdk_json_write_object_end(w);
+
+		if (hexkey) {
+			memset(hexkey, 0, strlen(hexkey));
+			free(hexkey);
+		}
+		if (hexkey2) {
+			memset(hexkey2, 0, strlen(hexkey2));
+			free(hexkey2);
+		}
 	}
 	return 0;
 }
@@ -1515,7 +1564,7 @@ _assign_device_qp(struct vbdev_crypto *crypto_bdev, struct device_qp *device_qp,
 		  struct crypto_io_channel *crypto_ch)
 {
 	pthread_mutex_lock(&g_device_qp_lock);
-	if (strcmp(crypto_bdev->drv_name, QAT) == 0) {
+	if (strcmp(crypto_bdev->opts->drv_name, QAT) == 0) {
 		/* For some QAT devices, the optimal qp to use is every 32nd as this spreads the
 		 * workload out over the multiple virtual functions in the device. For the devices
 		 * where this isn't the case, it doesn't hurt.
@@ -1534,8 +1583,16 @@ _assign_device_qp(struct vbdev_crypto *crypto_bdev, struct device_qp *device_qp,
 				g_next_qat_index = (g_next_qat_index + 1) % g_qat_total_qp;
 			}
 		}
-	} else if (strcmp(crypto_bdev->drv_name, AESNI_MB) == 0) {
+	} else if (strcmp(crypto_bdev->opts->drv_name, AESNI_MB) == 0) {
 		TAILQ_FOREACH(device_qp, &g_device_qp_aesni_mb, link) {
+			if (device_qp->in_use == false) {
+				crypto_ch->device_qp = device_qp;
+				device_qp->in_use = true;
+				break;
+			}
+		}
+	} else if (strcmp(crypto_bdev->opts->drv_name, MLX5) == 0) {
+		TAILQ_FOREACH(device_qp, &g_device_qp_mlx5, link) {
 			if (device_qp->in_use == false) {
 				crypto_ch->device_qp = device_qp;
 				device_qp->in_use = true;
@@ -1596,139 +1653,107 @@ crypto_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 /* Create the association from the bdev and vbdev name and insert
  * on the global list. */
 static int
-vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
-			 const char *crypto_pmd, const char *key,
-			 const char *cipher, const char *key2)
+vbdev_crypto_insert_name(struct vbdev_crypto_opts *opts, struct bdev_names **out)
 {
 	struct bdev_names *name;
-	int rc, j;
 	bool found = false;
+	int j;
+
+	assert(opts);
+	assert(out);
 
 	TAILQ_FOREACH(name, &g_bdev_names, link) {
-		if (strcmp(vbdev_name, name->vbdev_name) == 0) {
-			SPDK_ERRLOG("crypto bdev %s already exists\n", vbdev_name);
+		if (strcmp(opts->vbdev_name, name->opts->vbdev_name) == 0) {
+			SPDK_ERRLOG("Crypto bdev %s already exists\n", opts->vbdev_name);
 			return -EEXIST;
 		}
 	}
 
-	name = calloc(1, sizeof(struct bdev_names));
-	if (!name) {
-		SPDK_ERRLOG("could not allocate bdev_names\n");
-		return -ENOMEM;
-	}
-
-	name->bdev_name = strdup(bdev_name);
-	if (!name->bdev_name) {
-		SPDK_ERRLOG("could not allocate name->bdev_name\n");
-		rc = -ENOMEM;
-		goto error_alloc_bname;
-	}
-
-	name->vbdev_name = strdup(vbdev_name);
-	if (!name->vbdev_name) {
-		SPDK_ERRLOG("could not allocate name->vbdev_name\n");
-		rc = -ENOMEM;
-		goto error_alloc_vname;
-	}
-
-	name->drv_name = strdup(crypto_pmd);
-	if (!name->drv_name) {
-		SPDK_ERRLOG("could not allocate name->drv_name\n");
-		rc = -ENOMEM;
-		goto error_alloc_dname;
-	}
 	for (j = 0; j < MAX_NUM_DRV_TYPES ; j++) {
-		if (strcmp(crypto_pmd, g_driver_names[j]) == 0) {
+		if (strcmp(opts->drv_name, g_driver_names[j]) == 0) {
 			found = true;
 			break;
 		}
 	}
 	if (!found) {
-		SPDK_ERRLOG("invalid crypto PMD type %s\n", crypto_pmd);
-		rc = -EINVAL;
-		goto error_invalid_pmd;
+		SPDK_ERRLOG("Crypto PMD type %s is not supported.\n", opts->drv_name);
+		return -EINVAL;
 	}
 
-	name->key = strdup(key);
-	if (!name->key) {
-		SPDK_ERRLOG("could not allocate name->key\n");
-		rc = -ENOMEM;
-		goto error_alloc_key;
-	}
-	if (strnlen(name->key, (AES_CBC_KEY_LENGTH + 1)) != AES_CBC_KEY_LENGTH) {
-		SPDK_ERRLOG("invalid AES_CBC key length\n");
-		rc = -EINVAL;
-		goto error_invalid_key;
+	name = calloc(1, sizeof(struct bdev_names));
+	if (!name) {
+		SPDK_ERRLOG("Failed to allocate memory for bdev_names.\n");
+		return -ENOMEM;
 	}
 
-	if (strncmp(cipher, AES_XTS, sizeof(AES_XTS)) == 0) {
-		/* To please scan-build, input validation makes sure we can't
-		 * have this cipher without providing a key2.
-		 */
-		name->cipher = AES_XTS;
-		assert(key2);
-		if (strnlen(key2, (AES_XTS_KEY_LENGTH + 1)) != AES_XTS_KEY_LENGTH) {
-			SPDK_ERRLOG("invalid AES_XTS key length\n");
-			rc = -EINVAL;
-			goto error_invalid_key2;
-		}
-
-		name->key2 = strdup(key2);
-		if (!name->key2) {
-			SPDK_ERRLOG("could not allocate name->key2\n");
-			rc = -ENOMEM;
-			goto error_alloc_key2;
-		}
-	} else if (strncmp(cipher, AES_CBC, sizeof(AES_CBC)) == 0) {
-		name->cipher = AES_CBC;
-	} else {
-		SPDK_ERRLOG("Invalid cipher: %s\n", cipher);
-		rc = -EINVAL;
-		goto error_cipher;
-	}
-
+	name->opts = opts;
 	TAILQ_INSERT_TAIL(&g_bdev_names, name, link);
+	*out = name;
 
 	return 0;
+}
 
-	/* Error cleanup paths. */
-error_cipher:
-	free(name->key2);
-error_alloc_key2:
-error_invalid_key2:
-error_invalid_key:
-	free(name->key);
-error_alloc_key:
-error_invalid_pmd:
-	free(name->drv_name);
-error_alloc_dname:
-	free(name->vbdev_name);
-error_alloc_vname:
-	free(name->bdev_name);
-error_alloc_bname:
+void
+free_crypto_opts(struct vbdev_crypto_opts *opts)
+{
+	free(opts->bdev_name);
+	free(opts->vbdev_name);
+	free(opts->drv_name);
+	if (opts->xts_key) {
+		memset(opts->xts_key, 0,
+		       opts->key_size + opts->key2_size);
+		free(opts->xts_key);
+	}
+	memset(opts->key, 0, opts->key_size);
+	free(opts->key);
+	opts->key_size = 0;
+	if (opts->key2) {
+		memset(opts->key2, 0, opts->key2_size);
+		free(opts->key2);
+	}
+	opts->key2_size = 0;
+	free(opts);
+}
+
+static void
+vbdev_crypto_delete_name(struct bdev_names *name)
+{
+	TAILQ_REMOVE(&g_bdev_names, name, link);
+	if (name->opts) {
+		free_crypto_opts(name->opts);
+		name->opts = NULL;
+	}
 	free(name);
-	return rc;
 }
 
 /* RPC entry point for crypto creation. */
 int
-create_crypto_disk(const char *bdev_name, const char *vbdev_name,
-		   const char *crypto_pmd, const char *key,
-		   const char *cipher, const char *key2)
+create_crypto_disk(struct vbdev_crypto_opts *opts)
 {
+	struct bdev_names *name = NULL;
 	int rc;
 
-	rc = vbdev_crypto_insert_name(bdev_name, vbdev_name, crypto_pmd, key, cipher, key2);
+	rc = vbdev_crypto_insert_name(opts, &name);
 	if (rc) {
 		return rc;
 	}
 
-	rc = vbdev_crypto_claim(bdev_name);
+	rc = vbdev_crypto_claim(opts->bdev_name);
 	if (rc == -ENODEV) {
 		SPDK_NOTICELOG("vbdev creation deferred pending base bdev arrival\n");
 		rc = 0;
 	}
 
+	if (rc) {
+		assert(name != NULL);
+		/* In case of error we let the caller function to deallocate @opts
+		 * since it is its responsibiltiy. Setting name->opts = NULL let's
+		 * vbdev_crypto_delete_name() know it does not have to do anything
+		 * about @opts.
+		 */
+		name->opts = NULL;
+		vbdev_crypto_delete_name(name);
+	}
 	return rc;
 }
 
@@ -1757,13 +1782,7 @@ vbdev_crypto_finish(void)
 	struct vbdev_dev *device;
 
 	while ((name = TAILQ_FIRST(&g_bdev_names))) {
-		TAILQ_REMOVE(&g_bdev_names, name, link);
-		free(name->drv_name);
-		free(name->key);
-		free(name->bdev_name);
-		free(name->vbdev_name);
-		free(name->key2);
-		free(name);
+		vbdev_crypto_delete_name(name);
 	}
 
 	while ((device = TAILQ_FIRST(&g_vbdev_devs))) {
@@ -1775,6 +1794,7 @@ vbdev_crypto_finish(void)
 	/* These are removed in release_vbdev_dev() */
 	assert(TAILQ_EMPTY(&g_device_qp_qat));
 	assert(TAILQ_EMPTY(&g_device_qp_aesni_mb));
+	assert(TAILQ_EMPTY(&g_device_qp_mlx5));
 
 	rte_mempool_free(g_crypto_op_mp);
 	rte_mempool_free(g_mbuf_mp);
@@ -1856,6 +1876,7 @@ vbdev_crypto_claim(const char *bdev_name)
 	struct vbdev_dev *device;
 	struct spdk_bdev *bdev;
 	bool found = false;
+	uint8_t key_size;
 	int rc = 0;
 
 	if (g_number_of_claimed_volumes >= MAX_CRYPTO_VOLUMES) {
@@ -1868,55 +1889,31 @@ vbdev_crypto_claim(const char *bdev_name)
 	 * there's a match, create the crypto_bdev & bdev accordingly.
 	 */
 	TAILQ_FOREACH(name, &g_bdev_names, link) {
-		if (strcmp(name->bdev_name, bdev_name) != 0) {
+		if (strcmp(name->opts->bdev_name, bdev_name) != 0) {
 			continue;
 		}
 		SPDK_DEBUGLOG(vbdev_crypto, "Match on %s\n", bdev_name);
 
 		vbdev = calloc(1, sizeof(struct vbdev_crypto));
 		if (!vbdev) {
-			SPDK_ERRLOG("could not allocate crypto_bdev\n");
+			SPDK_ERRLOG("Failed to allocate memory for crypto_bdev.\n");
 			rc = -ENOMEM;
 			goto error_vbdev_alloc;
 		}
+		vbdev->crypto_bdev.product_name = "crypto";
 
-		vbdev->crypto_bdev.name = strdup(name->vbdev_name);
+		vbdev->crypto_bdev.name = strdup(name->opts->vbdev_name);
 		if (!vbdev->crypto_bdev.name) {
-			SPDK_ERRLOG("could not allocate crypto_bdev name\n");
+			SPDK_ERRLOG("Failed to allocate memory for crypto_bdev name.\n");
 			rc = -ENOMEM;
 			goto error_bdev_name;
 		}
-
-		vbdev->key = strdup(name->key);
-		if (!vbdev->key) {
-			SPDK_ERRLOG("could not allocate crypto_bdev key\n");
-			rc = -ENOMEM;
-			goto error_alloc_key;
-		}
-
-		if (name->key2) {
-			vbdev->key2 = strdup(name->key2);
-			if (!vbdev->key2) {
-				SPDK_ERRLOG("could not allocate crypto_bdev key2\n");
-				rc = -ENOMEM;
-				goto error_alloc_key2;
-			}
-		}
-
-		vbdev->drv_name = strdup(name->drv_name);
-		if (!vbdev->drv_name) {
-			SPDK_ERRLOG("could not allocate crypto_bdev drv_name\n");
-			rc = -ENOMEM;
-			goto error_drv_name;
-		}
-
-		vbdev->crypto_bdev.product_name = "crypto";
 
 		rc = spdk_bdev_open_ext(bdev_name, true, vbdev_crypto_base_bdev_event_cb,
 					NULL, &vbdev->base_desc);
 		if (rc) {
 			if (rc != -ENODEV) {
-				SPDK_ERRLOG("could not open bdev %s\n", bdev_name);
+				SPDK_ERRLOG("Failed to open bdev %s: error %d\n", bdev_name, rc);
 			}
 			goto error_open;
 		}
@@ -1924,32 +1921,28 @@ vbdev_crypto_claim(const char *bdev_name)
 		bdev = spdk_bdev_desc_get_bdev(vbdev->base_desc);
 		vbdev->base_bdev = bdev;
 
+		if (strcmp(name->opts->drv_name, MLX5) == 0) {
+			vbdev->qp_desc_nr = CRYPTO_QP_DESCRIPTORS_MLX5;
+		} else {
+			vbdev->qp_desc_nr = CRYPTO_QP_DESCRIPTORS;
+		}
+
 		vbdev->crypto_bdev.write_cache = bdev->write_cache;
-		vbdev->cipher = AES_CBC;
-		if (strcmp(vbdev->drv_name, QAT) == 0) {
+		if (strcmp(name->opts->drv_name, QAT) == 0) {
 			vbdev->crypto_bdev.required_alignment =
 				spdk_max(spdk_u32log2(bdev->blocklen), bdev->required_alignment);
 			SPDK_NOTICELOG("QAT in use: Required alignment set to %u\n",
 				       vbdev->crypto_bdev.required_alignment);
-			if (strcmp(name->cipher, AES_CBC) == 0) {
-				SPDK_NOTICELOG("QAT using cipher: AES_CBC\n");
-			} else {
-				SPDK_NOTICELOG("QAT using cipher: AES_XTS\n");
-				vbdev->cipher = AES_XTS;
-				/* DPDK expects they keys to be concatenated together. */
-				vbdev->xts_key = calloc(1, (AES_XTS_KEY_LENGTH * 2) + 1);
-				if (vbdev->xts_key == NULL) {
-					SPDK_ERRLOG("could not allocate memory for XTS key\n");
-					rc = -ENOMEM;
-					goto error_xts_key;
-				}
-				memcpy(vbdev->xts_key, vbdev->key, AES_XTS_KEY_LENGTH);
-				assert(name->key2);
-				memcpy(vbdev->xts_key + AES_XTS_KEY_LENGTH, name->key2, AES_XTS_KEY_LENGTH + 1);
-			}
+			SPDK_NOTICELOG("QAT using cipher: %s\n", name->opts->cipher);
+		} else if (strcmp(name->opts->drv_name, MLX5) == 0) {
+			vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
+			SPDK_NOTICELOG("MLX5 using cipher: %s\n", name->opts->cipher);
 		} else {
 			vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
+			SPDK_NOTICELOG("AESNI_MB using cipher: %s\n", name->opts->cipher);
 		}
+		vbdev->cipher_xform.cipher.iv.length = IV_LENGTH;
+
 		/* Note: CRYPTO_MAX_IO is in units of bytes, optimal_io_boundary is
 		 * in units of blocks.
 		 */
@@ -1969,6 +1962,11 @@ vbdev_crypto_claim(const char *bdev_name)
 		vbdev->crypto_bdev.ctxt = vbdev;
 		vbdev->crypto_bdev.fn_table = &vbdev_crypto_fn_table;
 		vbdev->crypto_bdev.module = &crypto_if;
+
+		/* Assign crypto opts from the name. The pointer is valid up to the point
+		 * the module is unloaded and all names removed from the list. */
+		vbdev->opts = name->opts;
+
 		TAILQ_INSERT_TAIL(&g_vbdev_crypto, vbdev, link);
 
 		spdk_io_device_register(vbdev, crypto_bdev_ch_create_cb, crypto_bdev_ch_destroy_cb,
@@ -1979,19 +1977,19 @@ vbdev_crypto_claim(const char *bdev_name)
 
 		rc = spdk_bdev_module_claim_bdev(bdev, vbdev->base_desc, vbdev->crypto_bdev.module);
 		if (rc) {
-			SPDK_ERRLOG("could not claim bdev %s\n", spdk_bdev_get_name(bdev));
+			SPDK_ERRLOG("Failed to claim bdev %s\n", spdk_bdev_get_name(bdev));
 			goto error_claim;
 		}
 
 		/* To init the session we have to get the cryptoDev device ID for this vbdev */
 		TAILQ_FOREACH(device, &g_vbdev_devs, link) {
-			if (strcmp(device->cdev_info.driver_name, vbdev->drv_name) == 0) {
+			if (strcmp(device->cdev_info.driver_name, vbdev->opts->drv_name) == 0) {
 				found = true;
 				break;
 			}
 		}
 		if (found == false) {
-			SPDK_ERRLOG("ERROR can't match crypto device driver to crypto vbdev!\n");
+			SPDK_ERRLOG("Failed to match crypto device driver to crypto vbdev.\n");
 			rc = -EINVAL;
 			goto error_cant_find_devid;
 		}
@@ -1999,14 +1997,14 @@ vbdev_crypto_claim(const char *bdev_name)
 		/* Get sessions. */
 		vbdev->session_encrypt = rte_cryptodev_sym_session_create(g_session_mp);
 		if (NULL == vbdev->session_encrypt) {
-			SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+			SPDK_ERRLOG("Failed to create encrypt crypto session.\n");
 			rc = -EINVAL;
 			goto error_session_en_create;
 		}
 
 		vbdev->session_decrypt = rte_cryptodev_sym_session_create(g_session_mp);
 		if (NULL == vbdev->session_decrypt) {
-			SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+			SPDK_ERRLOG("Failed to create decrypt crypto session.\n");
 			rc = -EINVAL;
 			goto error_session_de_create;
 		}
@@ -2014,23 +2012,28 @@ vbdev_crypto_claim(const char *bdev_name)
 		/* Init our per vbdev xform with the desired cipher options. */
 		vbdev->cipher_xform.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
 		vbdev->cipher_xform.cipher.iv.offset = IV_OFFSET;
-		if (strcmp(name->cipher, AES_CBC) == 0) {
-			vbdev->cipher_xform.cipher.key.data = vbdev->key;
+		if (strcmp(vbdev->opts->cipher, AES_CBC) == 0) {
+			vbdev->cipher_xform.cipher.key.data = vbdev->opts->key;
+			vbdev->cipher_xform.cipher.key.length = vbdev->opts->key_size;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
-			vbdev->cipher_xform.cipher.key.length = AES_CBC_KEY_LENGTH;
-		} else {
-			vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
+		} else if (strcmp(vbdev->opts->cipher, AES_XTS) == 0) {
+			key_size = vbdev->opts->key_size + vbdev->opts->key2_size;
+			vbdev->cipher_xform.cipher.key.data = vbdev->opts->xts_key;
+			vbdev->cipher_xform.cipher.key.length = key_size;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
-			vbdev->cipher_xform.cipher.key.length = AES_XTS_KEY_LENGTH * 2;
+		} else {
+			SPDK_ERRLOG("Invalid cipher name %s.\n", vbdev->opts->cipher);
+			rc = -EINVAL;
+			goto error_session_de_create;
 		}
-		vbdev->cipher_xform.cipher.iv.length = AES_CBC_IV_LENGTH;
+		vbdev->cipher_xform.cipher.iv.length = IV_LENGTH;
 
 		vbdev->cipher_xform.cipher.op = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
 		rc = rte_cryptodev_sym_session_init(device->cdev_id, vbdev->session_encrypt,
 						    &vbdev->cipher_xform,
 						    g_session_mp_priv ? g_session_mp_priv : g_session_mp);
 		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to init encrypt session!\n");
+			SPDK_ERRLOG("Failed to init encrypt session: error %d\n", rc);
 			rc = -EINVAL;
 			goto error_session_init;
 		}
@@ -2040,19 +2043,19 @@ vbdev_crypto_claim(const char *bdev_name)
 						    &vbdev->cipher_xform,
 						    g_session_mp_priv ? g_session_mp_priv : g_session_mp);
 		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to init decrypt session!\n");
+			SPDK_ERRLOG("Failed to init decrypt session: error %d\n", rc);
 			rc = -EINVAL;
 			goto error_session_init;
 		}
 
 		rc = spdk_bdev_register(&vbdev->crypto_bdev);
 		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to register bdev\n");
+			SPDK_ERRLOG("Failed to register vbdev: error %d\n", rc);
 			rc = -EINVAL;
 			goto error_bdev_register;
 		}
-		SPDK_DEBUGLOG(vbdev_crypto, "registered io_device and virtual bdev for: %s\n",
-			      name->vbdev_name);
+		SPDK_DEBUGLOG(vbdev_crypto, "Registered io_device and virtual bdev for: %s\n",
+			      vbdev->opts->vbdev_name);
 		break;
 	}
 
@@ -2070,25 +2073,8 @@ error_cant_find_devid:
 error_claim:
 	TAILQ_REMOVE(&g_vbdev_crypto, vbdev, link);
 	spdk_io_device_unregister(vbdev, NULL);
-	if (vbdev->xts_key) {
-		memset(vbdev->xts_key, 0, AES_XTS_KEY_LENGTH * 2);
-		free(vbdev->xts_key);
-	}
-error_xts_key:
 	spdk_bdev_close(vbdev->base_desc);
 error_open:
-	free(vbdev->drv_name);
-error_drv_name:
-	if (vbdev->key2) {
-		memset(vbdev->key2, 0, strlen(vbdev->key2));
-		free(vbdev->key2);
-	}
-error_alloc_key2:
-	if (vbdev->key) {
-		memset(vbdev->key, 0, strlen(vbdev->key));
-		free(vbdev->key);
-	}
-error_alloc_key:
 	free(vbdev->crypto_bdev.name);
 error_bdev_name:
 	free(vbdev);
@@ -2099,35 +2085,28 @@ error_vbdev_alloc:
 
 /* RPC entry for deleting a crypto vbdev. */
 void
-delete_crypto_disk(struct spdk_bdev *bdev, spdk_delete_crypto_complete cb_fn,
+delete_crypto_disk(const char *bdev_name, spdk_delete_crypto_complete cb_fn,
 		   void *cb_arg)
 {
 	struct bdev_names *name;
+	int rc;
 
-	if (!bdev || bdev->module != &crypto_if) {
-		cb_fn(cb_arg, -ENODEV);
-		return;
-	}
-
-	/* Remove the association (vbdev, bdev) from g_bdev_names. This is required so that the
-	 * vbdev does not get re-created if the same bdev is constructed at some other time,
-	 * unless the underlying bdev was hot-removed.
-	 */
-	TAILQ_FOREACH(name, &g_bdev_names, link) {
-		if (strcmp(name->vbdev_name, bdev->name) == 0) {
-			TAILQ_REMOVE(&g_bdev_names, name, link);
-			free(name->bdev_name);
-			free(name->vbdev_name);
-			free(name->drv_name);
-			free(name->key);
-			free(name->key2);
-			free(name);
-			break;
+	/* Some cleanup happens in the destruct callback. */
+	rc = spdk_bdev_unregister_by_name(bdev_name, &crypto_if, cb_fn, cb_arg);
+	if (rc == 0) {
+		/* Remove the association (vbdev, bdev) from g_bdev_names. This is required so that the
+		 * vbdev does not get re-created if the same bdev is constructed at some other time,
+		 * unless the underlying bdev was hot-removed.
+		 */
+		TAILQ_FOREACH(name, &g_bdev_names, link) {
+			if (strcmp(name->opts->vbdev_name, bdev_name) == 0) {
+				vbdev_crypto_delete_name(name);
+				break;
+			}
 		}
+	} else {
+		cb_fn(cb_arg, rc);
 	}
-
-	/* Additional cleanup happens in the destruct callback. */
-	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
 }
 
 /* Because we specified this function in our crypto bdev function table when we

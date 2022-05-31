@@ -40,6 +40,7 @@
 #include "spdk/env.h"
 #include "spdk/scheduler.h"
 #include "spdk/thread.h"
+#include "spdk/json.h"
 
 #include "spdk/log.h"
 #include "spdk_internal/event.h"
@@ -110,7 +111,6 @@ invalid:
 	free_rpc_spdk_kill_instance(&req);
 }
 SPDK_RPC_REGISTER("spdk_kill_instance", rpc_spdk_kill_instance, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(spdk_kill_instance, kill_instance)
 
 
 struct rpc_framework_monitor_context_switch {
@@ -151,7 +151,6 @@ rpc_framework_monitor_context_switch(struct spdk_jsonrpc_request *request,
 
 SPDK_RPC_REGISTER("framework_monitor_context_switch", rpc_framework_monitor_context_switch,
 		  SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(framework_monitor_context_switch, context_switch_monitor)
 
 struct rpc_get_stats_ctx {
 	struct spdk_jsonrpc_request *request;
@@ -474,7 +473,7 @@ free_rpc_framework_set_scheduler(struct rpc_set_scheduler_ctx *r)
 
 static const struct spdk_json_object_decoder rpc_set_scheduler_decoders[] = {
 	{"name", offsetof(struct rpc_set_scheduler_ctx, name), spdk_json_decode_string},
-	{"period", offsetof(struct rpc_set_scheduler_ctx, period), spdk_json_decode_uint64, true}
+	{"period", offsetof(struct rpc_set_scheduler_ctx, period), spdk_json_decode_uint64, true},
 };
 
 static void
@@ -482,11 +481,12 @@ rpc_framework_set_scheduler(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
 {
 	struct rpc_set_scheduler_ctx req = {NULL};
+	struct spdk_scheduler *scheduler = NULL;
 	int ret;
 
-	ret = spdk_json_decode_object(params, rpc_set_scheduler_decoders,
-				      SPDK_COUNTOF(rpc_set_scheduler_decoders),
-				      &req);
+	ret = spdk_json_decode_object_relaxed(params, rpc_set_scheduler_decoders,
+					      SPDK_COUNTOF(rpc_set_scheduler_decoders),
+					      &req);
 	if (ret) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
@@ -501,6 +501,15 @@ rpc_framework_set_scheduler(struct spdk_jsonrpc_request *request,
 	if (ret) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 spdk_strerror(ret));
+		goto end;
+	}
+
+	scheduler = spdk_scheduler_get();
+	if (scheduler != NULL && scheduler->set_opts != NULL) {
+		ret = scheduler->set_opts(params);
+	}
+	if (ret) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, spdk_strerror(ret));
 		goto end;
 	}
 
@@ -536,6 +545,11 @@ rpc_framework_get_scheduler(struct spdk_jsonrpc_request *request,
 	if (governor != NULL) {
 		spdk_json_write_named_string(w, "governor_name", governor->name);
 	}
+
+	if (scheduler != NULL && scheduler->get_opts != NULL) {
+		scheduler->get_opts(w);
+	}
+
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
 }

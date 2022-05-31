@@ -1223,6 +1223,10 @@ nvmf_prop_set_aqa(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 
 	aqa.raw = value;
 
+	/*
+	 * We don't need to explicitly check for maximum size, as the fields are
+	 * limited to 12 bits (4096).
+	 */
 	if (aqa.bits.asqs < SPDK_NVME_ADMIN_QUEUE_MIN_ENTRIES - 1 ||
 	    aqa.bits.acqs < SPDK_NVME_ADMIN_QUEUE_MIN_ENTRIES - 1 ||
 	    aqa.bits.reserved1 != 0 || aqa.bits.reserved2 != 0) {
@@ -2032,21 +2036,25 @@ struct copy_iovs_ctx {
 };
 
 static void
-_init_copy_iovs_ctx(struct copy_iovs_ctx *copy_ctx, struct iovec *iovs, int iovcnt)
+_clear_iovs(struct iovec *iovs, int iovcnt)
 {
 	int iov_idx = 0;
 	struct iovec *iov;
 
+	while (iov_idx < iovcnt) {
+		iov = &iovs[iov_idx];
+		memset(iov->iov_base, 0, iov->iov_len);
+		iov_idx++;
+	}
+}
+
+static void
+_init_copy_iovs_ctx(struct copy_iovs_ctx *copy_ctx, struct iovec *iovs, int iovcnt)
+{
 	copy_ctx->iovs = iovs;
 	copy_ctx->iovcnt = iovcnt;
 	copy_ctx->cur_iov_idx = 0;
 	copy_ctx->cur_iov_offset = 0;
-
-	while (iov_idx < copy_ctx->iovcnt) {
-		iov = &copy_ctx->iovs[iov_idx];
-		memset(iov->iov_base, 0, iov->iov_len);
-		iov_idx++;
-	}
 }
 
 static size_t
@@ -2611,6 +2619,8 @@ static void
 nvmf_ctrlr_populate_oacs(struct spdk_nvmf_ctrlr *ctrlr,
 			 struct spdk_nvme_ctrlr_data *cdata)
 {
+	cdata->oacs = ctrlr->cdata.oacs;
+
 	cdata->oacs.virtualization_management =
 		g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_OPC_VIRTUALIZATION_MANAGEMENT].hdlr != NULL;
 	cdata->oacs.nvme_mi = g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_OPC_NVME_MI_SEND].hdlr != NULL
@@ -2654,7 +2664,7 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 	cdata->maxcmd = transport->opts.max_queue_depth;
 	cdata->sgls = ctrlr->cdata.sgls;
 	cdata->fuses.compare_and_write = 1;
-	cdata->acwu = 1;
+	cdata->acwu = 0; /* ACWU is 0-based. */
 	if (subsystem->flags.ana_reporting) {
 		cdata->mnan = subsystem->max_nsid;
 	}
@@ -2686,14 +2696,7 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 		cdata->rab = 6;
 		cdata->cmic.multi_port = 1;
 		cdata->cmic.multi_ctrlr = 1;
-		if (subsystem->flags.ana_reporting) {
-			/* Asymmetric Namespace Access Reporting is supported. */
-			cdata->cmic.ana_reporting = 1;
-		}
 		cdata->oaes.ns_attribute_notices = 1;
-		if (subsystem->flags.ana_reporting) {
-			cdata->oaes.ana_change_notices = 1;
-		}
 		cdata->ctratt.host_id_exhid_supported = 1;
 		/* We do not have any actual limitation to the number of abort commands.
 		 * We follow the recommendation by the NVMe specification.
@@ -2718,6 +2721,10 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 		cdata->oncs.write_zeroes = nvmf_ctrlr_write_zeroes_supported(ctrlr);
 		cdata->oncs.reservations = ctrlr->cdata.oncs.reservations;
 		if (subsystem->flags.ana_reporting) {
+			/* Asymmetric Namespace Access Reporting is supported. */
+			cdata->cmic.ana_reporting = 1;
+			cdata->oaes.ana_change_notices = 1;
+
 			cdata->anatt = ANA_TRANSITION_TIME_IN_SEC;
 			/* ANA Change state is not used, and ANA Persistent Loss state
 			 * is not supported for now.
@@ -3325,7 +3332,7 @@ nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 	}
 
 	if (req->data && spdk_nvme_opc_get_data_transfer(cmd->opc) == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
-		memset(req->data, 0, req->length);
+		_clear_iovs(req->iov, req->iovcnt);
 	}
 
 	if (ctrlr->subsys->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY) {

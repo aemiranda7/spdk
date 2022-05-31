@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2019, Nutanix Inc. All rights reserved.
+ *   Copyright (c) 2019-2022, Nutanix Inc. All rights reserved.
  *   Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -52,6 +52,14 @@
 
 #include "nvmf_internal.h"
 
+#define SWAP(x, y)                  \
+	do                          \
+	{                           \
+		typeof(x) _tmp = x; \
+		x = y;              \
+		y = _tmp;           \
+	} while (0)
+
 #define NVMF_VFIO_USER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define NVMF_VFIO_USER_DEFAULT_AQ_DEPTH 32
 #define NVMF_VFIO_USER_DEFAULT_MAX_IO_SIZE ((NVMF_REQ_MAX_BUFFERS - 1) << SHIFT_4KB)
@@ -59,6 +67,9 @@
 
 #define NVME_DOORBELLS_OFFSET	0x1000
 #define NVMF_VFIO_USER_DOORBELLS_SIZE 0x1000
+#define NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT 2
+#define NVMF_VFIO_USER_SET_EVENTIDX_MAX_ATTEMPTS 3
+#define NVMF_VFIO_USER_EVENTIDX_POLL UINT32_MAX
 
 /*
  * NVMe driver reads 4096 bytes, which is the extended PCI configuration space
@@ -161,10 +172,20 @@ struct vfio_user_nvme_migr_header {
 	uint64_t	nvmf_data_offset;
 	uint64_t	nvmf_data_len;
 
+	/*
+	 * Whether or not shadow doorbells are used in the source. 0 is a valid DMA
+	 * address.
+	 */
+	bool		sdbl;
+
+	/* Shadow doorbell DMA addresses. */
+	uint64_t	shadow_doorbell_buffer;
+	uint64_t	eventidx_buffer;
+
 	/* Reserved memory space for new added fields, the
 	 * field is always at the end of this data structure.
 	 */
-	uint8_t		unused[3356];
+	uint8_t		unused[3336];
 };
 SPDK_STATIC_ASSERT(sizeof(struct vfio_user_nvme_migr_header) == 0x1000, "Incorrect size");
 
@@ -272,6 +293,10 @@ struct nvmf_vfio_user_sq {
 	enum nvmf_vfio_user_sq_state		sq_state;
 
 	uint32_t				head;
+	volatile uint32_t			*dbl_tailp;
+
+	/* Whether a shadow doorbell eventidx needs setting. */
+	bool					need_rearm;
 
 	/* multiple SQs can be mapped to the same CQ */
 	uint16_t				cqid;
@@ -307,16 +332,28 @@ struct nvmf_vfio_user_cq {
 	enum nvmf_vfio_user_cq_state		cq_state;
 
 	uint32_t				tail;
+	volatile uint32_t			*dbl_headp;
+
 	bool					phase;
 
 	uint16_t				iv;
 	bool					ien;
+
+	uint32_t				last_head;
+	uint32_t				last_trigger_irq_tail;
 };
 
 struct nvmf_vfio_user_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 	TAILQ_ENTRY(nvmf_vfio_user_poll_group)	link;
 	TAILQ_HEAD(, nvmf_vfio_user_sq)		sqs;
+};
+
+struct nvmf_vfio_user_shadow_doorbells {
+	volatile uint32_t			*shadow_doorbells;
+	volatile uint32_t			*eventidxs;
+	dma_sg_t				*sgs;
+	struct iovec				*iovs;
 };
 
 struct nvmf_vfio_user_ctrlr {
@@ -348,21 +385,34 @@ struct nvmf_vfio_user_ctrlr {
 
 	TAILQ_ENTRY(nvmf_vfio_user_ctrlr)	link;
 
-	volatile uint32_t			*doorbells;
+	volatile uint32_t			*bar0_doorbells;
+	struct nvmf_vfio_user_shadow_doorbells	*sdbl;
+	/*
+	 * Shadow doorbells PRPs to provide during the stop-and-copy state.
+	 */
+	uint64_t				shadow_doorbell_buffer;
+	uint64_t				eventidx_buffer;
+
+	bool					adaptive_irqs_enabled;
+	bool					self_kick_requested;
 };
 
+/* Endpoint in vfio-user is associated with a socket file, which
+ * is the representative of a PCI endpoint.
+ */
 struct nvmf_vfio_user_endpoint {
 	struct nvmf_vfio_user_transport		*transport;
 	vfu_ctx_t				*vfu_ctx;
 	struct spdk_poller			*accept_poller;
 	struct spdk_thread			*accept_thread;
+	bool					interrupt_mode;
 	struct msixcap				*msix;
 	vfu_pci_config_space_t			*pci_config_space;
 	int					devmem_fd;
 	int					accept_intr_fd;
 	struct spdk_interrupt			*accept_intr;
 
-	volatile uint32_t			*doorbells;
+	volatile uint32_t			*bar0_doorbells;
 
 	int					migr_fd;
 	void					*migr_data;
@@ -370,16 +420,29 @@ struct nvmf_vfio_user_endpoint {
 	struct spdk_nvme_transport_id		trid;
 	const struct spdk_nvmf_subsystem	*subsystem;
 
+	/* Controller is associated with an active socket connection,
+	 * the lifecycle of the controller is same as the VM.
+	 * Currently we only support one active connection, as the NVMe
+	 * specification defines, we may support multiple controllers in
+	 * future, so that it can support e.g: RESERVATION.
+	 */
 	struct nvmf_vfio_user_ctrlr		*ctrlr;
 	pthread_mutex_t				lock;
 
 	bool					need_async_destroy;
+	/* The subsystem is in PAUSED state and need to be resumed, TRUE
+	 * only when migration is done successfully and the controller is
+	 * in source VM.
+	 */
+	bool					need_resume;
 
 	TAILQ_ENTRY(nvmf_vfio_user_endpoint)	link;
 };
 
 struct nvmf_vfio_user_transport_opts {
 	bool					disable_mappable_bar0;
+	bool					disable_adaptive_irq;
+	bool					disable_shadow_doorbells;
 };
 
 struct nvmf_vfio_user_transport {
@@ -426,19 +489,17 @@ sq_headp(struct nvmf_vfio_user_sq *sq)
 }
 
 static inline volatile uint32_t *
-sq_dbl_tailp(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_sq *sq)
+sq_dbl_tailp(struct nvmf_vfio_user_sq *sq)
 {
-	assert(ctrlr != NULL);
 	assert(sq != NULL);
-	return &ctrlr->doorbells[queue_index(sq->qid, false)];
+	return sq->dbl_tailp;
 }
 
 static inline volatile uint32_t *
-cq_dbl_headp(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq)
+cq_dbl_headp(struct nvmf_vfio_user_cq *cq)
 {
-	assert(ctrlr != NULL);
 	assert(cq != NULL);
-	return &ctrlr->doorbells[queue_index(cq->qid, true)];
+	return cq->dbl_headp;
 }
 
 static inline volatile uint32_t *
@@ -476,11 +537,10 @@ cq_tail_advance(struct nvmf_vfio_user_cq *cq)
 }
 
 static inline bool
-cq_is_full(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq)
+cq_is_full(struct nvmf_vfio_user_cq *cq)
 {
 	uint32_t qindex;
 
-	assert(ctrlr != NULL);
 	assert(cq != NULL);
 
 	qindex = *cq_tailp(cq) + 1;
@@ -488,13 +548,97 @@ cq_is_full(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq)
 		qindex = 0;
 	}
 
-	return qindex == *cq_dbl_headp(ctrlr, cq);
+	return qindex == *cq_dbl_headp(cq);
+}
+
+static bool
+io_q_exists(struct nvmf_vfio_user_ctrlr *vu_ctrlr, const uint16_t qid, const bool is_cq)
+{
+	assert(vu_ctrlr != NULL);
+
+	if (qid == 0 || qid >= NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR) {
+		return false;
+	}
+
+	if (is_cq) {
+		if (vu_ctrlr->cqs[qid] == NULL) {
+			return false;
+		}
+
+		return (vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_DELETED &&
+			vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_UNUSED);
+	}
+
+	if (vu_ctrlr->sqs[qid] == NULL) {
+		return false;
+	}
+
+	return (vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_DELETED &&
+		vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_UNUSED);
 }
 
 static inline size_t
 vfio_user_migr_data_len(void)
 {
 	return SPDK_ALIGN_CEIL(sizeof(struct vfio_user_nvme_migr_state), PAGE_SIZE);
+}
+
+static int vfio_user_ctrlr_intr(void *ctx);
+
+/*
+ * Wrap vfio_user_ctrlr_intr() such that it can be used with
+ * spdk_thread_send_msg().
+ * Pollers have type int (*)(void *) while message functions should have type
+ * void (*)(void *), so simply discard the returned value.
+ */
+static void
+vfio_user_ctrlr_intr_wrapper(void *ctx)
+{
+	vfio_user_ctrlr_intr(ctx);
+}
+
+static inline int
+self_kick(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	assert(ctrlr != NULL);
+	assert(ctrlr->thread != NULL);
+
+	if (ctrlr->self_kick_requested) {
+		return 0;
+	}
+
+	ctrlr->self_kick_requested = true;
+
+	return spdk_thread_send_msg(ctrlr->thread,
+				    vfio_user_ctrlr_intr_wrapper,
+				    ctrlr);
+}
+
+/*
+ * Make the given DMA address and length available (locally mapped) via iov.
+ */
+static void *
+map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg,
+	struct iovec *iov, int prot)
+{
+	int ret;
+
+	assert(ctx != NULL);
+	assert(sg != NULL);
+	assert(iov != NULL);
+
+	ret = vfu_addr_to_sg(ctx, (void *)(uintptr_t)addr, len, sg, 1, prot);
+	if (ret < 0) {
+		return NULL;
+	}
+
+	ret = vfu_map_sg(ctx, sg, iov, 1, 0);
+	if (ret != 0) {
+		return NULL;
+	}
+
+	assert(iov->iov_base != NULL);
+	return iov->iov_base;
 }
 
 static int
@@ -728,6 +872,161 @@ ctrlr_id(struct nvmf_vfio_user_ctrlr *ctrlr)
 	return endpoint_id(ctrlr->endpoint);
 }
 
+/*
+ * For each queue, update the location of its doorbell to the correct location:
+ * either our own BAR0, or the guest's configured shadow doorbell area.
+ *
+ * The Admin queue (qid: 0) does not ever use shadow doorbells.
+ */
+static void
+vfio_user_ctrlr_switch_doorbells(struct nvmf_vfio_user_ctrlr *ctrlr, bool shadow)
+{
+	volatile uint32_t *doorbells = shadow ? ctrlr->sdbl->shadow_doorbells :
+				       ctrlr->bar0_doorbells;
+
+	assert(doorbells != NULL);
+
+	for (size_t i = 1; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		struct nvmf_vfio_user_sq *sq = ctrlr->sqs[i];
+		struct nvmf_vfio_user_cq *cq = ctrlr->cqs[i];
+
+		if (sq != NULL) {
+			sq->dbl_tailp = doorbells + queue_index(sq->qid, false);
+		}
+
+		if (cq != NULL) {
+			cq->dbl_headp = doorbells + queue_index(cq->qid, true);
+		}
+	}
+}
+
+static void
+unmap_sdbl(vfu_ctx_t *vfu_ctx, struct nvmf_vfio_user_shadow_doorbells *sdbl)
+{
+	assert(vfu_ctx != NULL);
+	assert(sdbl != NULL);
+
+	/*
+	 * An allocation error would result in only one of the two being
+	 * non-NULL.  If that is the case, no memory should have been mapped.
+	 */
+	if (sdbl->iovs == NULL || sdbl->sgs == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; i < NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT; ++i) {
+		struct iovec *iov;
+		dma_sg_t *sg;
+
+		if (!sdbl->iovs[i].iov_len) {
+			continue;
+		}
+
+		sg = (dma_sg_t *)((uintptr_t)sdbl->sgs + i * dma_sg_size());
+		iov = sdbl->iovs + i;
+
+		vfu_unmap_sg(vfu_ctx, sg, iov, 1);
+	}
+}
+
+static void
+free_sdbl(vfu_ctx_t *vfu_ctx, struct nvmf_vfio_user_shadow_doorbells *sdbl)
+{
+	if (sdbl == NULL) {
+		return;
+	}
+
+	unmap_sdbl(vfu_ctx, sdbl);
+
+	/*
+	 * sdbl->shadow_doorbells and sdbl->eventidxs were mapped,
+	 * not allocated, so don't free() them.
+	 */
+	free(sdbl->sgs);
+	free(sdbl->iovs);
+	free(sdbl);
+}
+
+static struct nvmf_vfio_user_shadow_doorbells *
+map_sdbl(vfu_ctx_t *vfu_ctx, uint64_t prp1, uint64_t prp2, size_t len)
+{
+	struct nvmf_vfio_user_shadow_doorbells *sdbl = NULL;
+	dma_sg_t *sg2 = NULL;
+	void *p;
+
+	assert(vfu_ctx != NULL);
+
+	sdbl = calloc(1, sizeof(*sdbl));
+	if (sdbl == NULL) {
+		goto err;
+	}
+
+	sdbl->sgs = calloc(NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT, dma_sg_size());
+	sdbl->iovs = calloc(NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT, sizeof(*sdbl->iovs));
+	if (sdbl->sgs == NULL || sdbl->iovs == NULL) {
+		goto err;
+	}
+
+	/* Map shadow doorbell buffer (PRP1). */
+	p = map_one(vfu_ctx, prp1, len, sdbl->sgs, sdbl->iovs,
+		    PROT_READ | PROT_WRITE);
+
+	if (p == NULL) {
+		goto err;
+	}
+
+	/*
+	 * Map eventidx buffer (PRP2).
+	 * Should only be written to by the controller.
+	 */
+
+	sg2 = (dma_sg_t *)((uintptr_t)sdbl->sgs + dma_sg_size());
+
+	p = map_one(vfu_ctx, prp2, len, sg2, sdbl->iovs + 1,
+		    PROT_READ | PROT_WRITE);
+
+	if (p == NULL) {
+		goto err;
+	}
+
+	sdbl->shadow_doorbells = (uint32_t *)sdbl->iovs[0].iov_base;
+	sdbl->eventidxs = (uint32_t *)sdbl->iovs[1].iov_base;
+
+	return sdbl;
+
+err:
+	free_sdbl(vfu_ctx, sdbl);
+	return NULL;
+}
+
+/*
+ * Copy doorbells from one buffer to the other, during switches betweeen BAR0
+ * doorbells and shadow doorbells.
+ */
+static void
+copy_doorbells(struct nvmf_vfio_user_ctrlr *ctrlr,
+	       const volatile uint32_t *from, volatile uint32_t *to)
+{
+	assert(ctrlr != NULL);
+	assert(from != NULL);
+	assert(to != NULL);
+
+	SPDK_DEBUGLOG(vfio_user_db,
+		      "%s: migrating shadow doorbells from %p to %p\n",
+		      ctrlr_id(ctrlr), from, to);
+
+	/* Can't use memcpy because it doesn't respect volatile semantics. */
+	for (size_t i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; ++i) {
+		if (ctrlr->sqs[i] != NULL) {
+			to[queue_index(i, false)] = from[queue_index(i, false)];
+		}
+
+		if (ctrlr->cqs[i] != NULL) {
+			to[queue_index(i, true)] = from[queue_index(i, true)];
+		}
+	}
+}
+
 static void
 fail_ctrlr(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 {
@@ -763,8 +1062,8 @@ nvmf_vfio_user_destroy_endpoint(struct nvmf_vfio_user_endpoint *endpoint)
 	spdk_interrupt_unregister(&endpoint->accept_intr);
 	spdk_poller_unregister(&endpoint->accept_poller);
 
-	if (endpoint->doorbells) {
-		munmap((void *)endpoint->doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
+	if (endpoint->bar0_doorbells) {
+		munmap((void *)endpoint->bar0_doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
 	}
 
 	if (endpoint->devmem_fd > 0) {
@@ -823,6 +1122,16 @@ static const struct spdk_json_object_decoder vfio_user_transport_opts_decoder[] 
 		offsetof(struct nvmf_vfio_user_transport, transport_opts.disable_mappable_bar0),
 		spdk_json_decode_bool, true
 	},
+	{
+		"disable_adaptive_irq",
+		offsetof(struct nvmf_vfio_user_transport, transport_opts.disable_adaptive_irq),
+		spdk_json_decode_bool, true
+	},
+	{
+		"disable_shadow_doorbells",
+		offsetof(struct nvmf_vfio_user_transport, transport_opts.disable_shadow_doorbells),
+		spdk_json_decode_bool, true
+	},
 };
 
 static struct spdk_nvmf_transport *
@@ -866,9 +1175,6 @@ nvmf_vfio_user_create(struct spdk_nvmf_transport_opts *opts)
 		goto cleanup;
 	}
 
-	SPDK_DEBUGLOG(nvmf_vfio, "vfio_user transport: disable_mappable_bar0=%d\n",
-		      vu_transport->transport_opts.disable_mappable_bar0);
-
 	/*
 	 * To support interrupt mode, the transport must be configured with
 	 * mappable BAR0 disabled: we need a vfio-user message to wake us up
@@ -877,6 +1183,30 @@ nvmf_vfio_user_create(struct spdk_nvmf_transport_opts *opts)
 	 */
 	vu_transport->intr_mode_supported =
 		vu_transport->transport_opts.disable_mappable_bar0;
+
+	/*
+	 * If BAR0 is mappable, it doesn't make sense to support shadow
+	 * doorbells, so explicitly turn it off.
+	 */
+	if (!vu_transport->transport_opts.disable_mappable_bar0) {
+		vu_transport->transport_opts.disable_shadow_doorbells = true;
+	}
+
+	/*
+	 * If we are in interrupt mode, we cannot support adaptive IRQs, as
+	 * there is no guarantee the SQ poller will run subsequently to send
+	 * pending IRQs.
+	 */
+	if (spdk_interrupt_mode_is_enabled()) {
+		vu_transport->transport_opts.disable_adaptive_irq = true;
+	}
+
+	SPDK_DEBUGLOG(nvmf_vfio, "vfio_user transport: disable_mappable_bar0=%d\n",
+		      vu_transport->transport_opts.disable_mappable_bar0);
+	SPDK_DEBUGLOG(nvmf_vfio, "vfio_user transport: disable_adaptive_irq=%d\n",
+		      vu_transport->transport_opts.disable_adaptive_irq);
+	SPDK_DEBUGLOG(nvmf_vfio, "vfio_user transport: disable_shadow_doorbells=%d\n",
+		      vu_transport->transport_opts.disable_shadow_doorbells);
 
 	return &vu_transport->transport;
 
@@ -897,27 +1227,26 @@ max_queue_size(struct nvmf_vfio_user_ctrlr const *vu_ctrlr)
 	return vu_ctrlr->ctrlr->vcprop.cap.bits.mqes + 1;
 }
 
-static void *
-map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov, int prot)
+static uint32_t
+doorbell_stride(const struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 {
-	int ret;
+	assert(vu_ctrlr != NULL);
+	assert(vu_ctrlr->ctrlr != NULL);
 
-	assert(ctx != NULL);
-	assert(sg != NULL);
-	assert(iov != NULL);
+	return vu_ctrlr->ctrlr->vcprop.cap.bits.dstrd;
+}
 
-	ret = vfu_addr_to_sg(ctx, (void *)(uintptr_t)addr, len, sg, 1, prot);
-	if (ret < 0) {
-		return NULL;
-	}
+static uintptr_t
+memory_page_size(const struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	uint32_t memory_page_shift = vu_ctrlr->ctrlr->vcprop.cc.bits.mps + 12;
+	return 1ul << memory_page_shift;
+}
 
-	ret = vfu_map_sg(ctx, sg, iov, 1, 0);
-	if (ret != 0) {
-		return NULL;
-	}
-
-	assert(iov->iov_base != NULL);
-	return iov->iov_base;
+static uintptr_t
+memory_page_mask(const struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	return ~(memory_page_size(ctrlr) - 1);
 }
 
 static int
@@ -987,9 +1316,197 @@ asq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 		return ret;
 	}
 
-	*sq_dbl_tailp(ctrlr, sq) = 0;
+	/* The Admin queue (qid: 0) does not ever use shadow doorbells. */
+	sq->dbl_tailp = ctrlr->bar0_doorbells + queue_index(0, false);
+
+	*sq_dbl_tailp(sq) = 0;
 
 	return 0;
+}
+
+/*
+ * Updates eventidx to set an SQ into interrupt or polling mode.
+ *
+ * Returns false if the current SQ tail does not match the SQ head, as
+ * this means that the host has submitted more items to the queue while we were
+ * not looking - or during the event index update. In that case, we must retry,
+ * or otherwise make sure we are going to wake up again.
+ */
+static bool
+set_sq_eventidx(struct nvmf_vfio_user_sq *sq)
+{
+	struct nvmf_vfio_user_ctrlr *ctrlr;
+	volatile uint32_t *sq_tail_eidx;
+	uint32_t old_tail, new_tail;
+
+	assert(sq != NULL);
+	assert(sq->ctrlr != NULL);
+	assert(sq->ctrlr->sdbl != NULL);
+	assert(sq->need_rearm);
+
+	ctrlr = sq->ctrlr;
+
+	SPDK_DEBUGLOG(vfio_user_db, "%s: updating eventidx of sqid:%u\n",
+		      ctrlr_id(ctrlr), sq->qid);
+
+	sq_tail_eidx = ctrlr->sdbl->eventidxs + queue_index(sq->qid, false);
+
+	assert(ctrlr->endpoint != NULL);
+
+	if (!ctrlr->endpoint->interrupt_mode) {
+		/* No synchronisation necessary. */
+		*sq_tail_eidx = NVMF_VFIO_USER_EVENTIDX_POLL;
+		return true;
+	}
+
+	old_tail = *sq_dbl_tailp(sq);
+	*sq_tail_eidx = old_tail;
+
+	/*
+	 * Ensure that the event index is updated before re-reading the tail
+	 * doorbell. If it's not, then the host might race us and update the
+	 * tail after the second read but before the event index is written, so
+	 * it won't write to BAR0 and we'll miss the update.
+	 *
+	 * The driver should provide similar ordering with an mb().
+	 */
+	spdk_mb();
+
+	/*
+	 * Check if the host has updated the tail doorbell after we've read it
+	 * for the first time, but before the event index was written. If that's
+	 * the case, then we've lost the race and we need to update the event
+	 * index again (after polling the queue, since the host won't write to
+	 * BAR0).
+	 */
+	new_tail = *sq_dbl_tailp(sq);
+
+	/*
+	 * We might poll the queue straight after this function returns if the
+	 * tail has been updated, so we need to ensure that any changes to the
+	 * queue will be visible to us if the doorbell has been updated.
+	 *
+	 * The driver should provide similar ordering with a wmb() to ensure
+	 * that the queue is written before it updates the tail doorbell.
+	 */
+	spdk_rmb();
+
+	SPDK_DEBUGLOG(vfio_user_db, "%s: sqid:%u, old_tail=%u, new_tail=%u, "
+		      "sq_head=%u\n", ctrlr_id(ctrlr), sq->qid, old_tail,
+		      new_tail, *sq_headp(sq));
+
+	if (new_tail == *sq_headp(sq)) {
+		sq->need_rearm = false;
+		return true;
+	}
+
+	/*
+	 * We've lost the race: the tail was updated since we last polled,
+	 * including if it happened within this routine.
+	 *
+	 * The caller should retry after polling (think of this as a cmpxchg
+	 * loop); if we go to sleep while the SQ is not empty, then we won't
+	 * process the remaining events.
+	 */
+	return false;
+}
+
+static int
+nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq);
+
+/*
+ * Arrange for an SQ to interrupt us if written. Returns non-zero if we
+ * processed some SQ entries.
+ */
+static int
+set_sq_intr_mode(struct nvmf_vfio_user_ctrlr *ctrlr,
+		 struct nvmf_vfio_user_sq *sq)
+{
+	int count = 0;
+	size_t i;
+
+	if (!sq->need_rearm) {
+		return 0;
+	}
+
+	for (i = 0; i < NVMF_VFIO_USER_SET_EVENTIDX_MAX_ATTEMPTS; i++) {
+		int ret;
+
+		if (set_sq_eventidx(sq)) {
+			/* We won the race and set eventidx; done. */
+			return count;
+		}
+
+		ret = nvmf_vfio_user_sq_poll(sq);
+
+		count += (ret < 0) ? 1 : ret;
+
+		/*
+		 * set_sq_eventidx() hit the race, so we expected
+		 * to process at least one command from this queue.
+		 * If there were no new commands waiting for us, then
+		 * we must have hit an unexpected race condition.
+		 */
+		if (ret == 0) {
+			SPDK_ERRLOG("%s: unexpected race condition detected "
+				    "while updating the shadow doorbell buffer\n",
+				    ctrlr_id(ctrlr));
+
+			fail_ctrlr(ctrlr);
+			return count;
+		}
+	}
+
+	SPDK_DEBUGLOG(vfio_user_db,
+		      "%s: set_sq_eventidx() lost the race %zu times\n",
+		      ctrlr_id(ctrlr), i);
+
+	/*
+	 * We couldn't arrange an eventidx guaranteed to cause a BAR0 write, as
+	 * we raced with the producer too many times; force ourselves to wake up
+	 * instead. We'll process all queues at that point.
+	 */
+	self_kick(ctrlr);
+
+	return count;
+}
+
+/*
+ * We're in interrupt mode, and potentially about to go to sleep. We need to
+ * make sure any further I/O submissions are guaranteed to wake us up: for
+ * shadow doorbells that means we may need to go through set_sq_eventidx() for
+ * every SQ that needs re-arming.
+ *
+ * Returns non-zero if we processed something.
+ */
+static int
+set_ctrlr_intr_mode(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	int count = 0;
+
+	assert(ctrlr != NULL);
+
+	if (ctrlr->sdbl == NULL) {
+		return 0;
+	}
+
+	/*
+	 * The admin queue (qid: 0) doesn't use the shadow doorbell buffer, so
+	 * skip it.
+	 */
+	for (size_t i = 1; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; ++i) {
+		struct nvmf_vfio_user_sq *sq = ctrlr->sqs[i];
+
+		if (sq == NULL ||
+		    sq->sq_state != VFIO_USER_SQ_ACTIVE ||
+		    !sq->size) {
+			continue;
+		}
+
+		count += set_sq_intr_mode(ctrlr, ctrlr->sqs[i]);
+	}
+
+	return count;
 }
 
 static int
@@ -1021,7 +1538,10 @@ acq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 		return ret;
 	}
 
-	*cq_dbl_headp(ctrlr, cq) = 0;
+	/* The Admin queue (qid: 0) does not ever use shadow doorbells. */
+	cq->dbl_headp = ctrlr->bar0_doorbells + queue_index(0, true);
+
+	*cq_dbl_headp(cq) = 0;
 
 	return 0;
 }
@@ -1086,8 +1606,8 @@ static int
 post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq,
 		uint32_t cdw0, uint16_t sqid, uint16_t cid, uint16_t sc, uint16_t sct)
 {
+	struct spdk_nvme_status cpl_status = { 0 };
 	struct spdk_nvme_cpl *cpl;
-	const struct spdk_nvmf_registers *regs;
 	int err;
 
 	assert(ctrlr != NULL);
@@ -1096,18 +1616,10 @@ post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq
 		return 0;
 	}
 
-	regs = spdk_nvmf_ctrlr_get_regs(ctrlr->ctrlr);
-	if (regs->csts.bits.shst != SPDK_NVME_SHST_NORMAL) {
-		SPDK_DEBUGLOG(nvmf_vfio,
-			      "%s: ignore completion SQ%d cid=%d status=%#x\n",
-			      ctrlr_id(ctrlr), sqid, cid, sc);
-		return 0;
-	}
-
-	if (cq_is_full(ctrlr, cq)) {
-		SPDK_ERRLOG("%s: CQ%d full (tail=%d, head=%d)\n",
+	if (cq_is_full(cq)) {
+		SPDK_ERRLOG("%s: cqid:%d full (tail=%d, head=%d)\n",
 			    ctrlr_id(ctrlr), cq->qid, *cq_tailp(cq),
-			    *cq_dbl_headp(ctrlr, cq));
+			    *cq_dbl_headp(cq));
 		return -1;
 	}
 
@@ -1115,30 +1627,32 @@ post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq
 
 	assert(ctrlr->sqs[sqid] != NULL);
 	SPDK_DEBUGLOG(nvmf_vfio,
-		      "%s: request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
-		      ctrlr_id(ctrlr), sqid, cid, sc, *sq_headp(ctrlr->sqs[sqid]),
-		      *cq_tailp(cq));
+		      "%s: request complete sqid:%d cid=%d status=%#x "
+		      "sqhead=%d cq tail=%d\n", ctrlr_id(ctrlr), sqid, cid, sc,
+		      *sq_headp(ctrlr->sqs[sqid]), *cq_tailp(cq));
 
 	cpl->sqhd = *sq_headp(ctrlr->sqs[sqid]);
 	cpl->sqid = sqid;
 	cpl->cid = cid;
 	cpl->cdw0 = cdw0;
-	cpl->status.dnr = 0x0;
-	cpl->status.m = 0x0;
-	cpl->status.sct = sct;
-	cpl->status.sc = sc;
-	cpl->status.p = cq->phase;
+
+	/*
+	 * This is a bitfield: instead of setting the individual bits we need
+	 * directly in cpl->status, which would cause a read-modify-write cycle,
+	 * we'll avoid reading from the CPL altogether by filling in a local
+	 * cpl_status variable, then writing the whole thing.
+	 */
+	cpl_status.sct = sct;
+	cpl_status.sc = sc;
+	cpl_status.p = cq->phase;
+	cpl->status = cpl_status;
 
 	/* Ensure the Completion Queue Entry is visible. */
 	spdk_wmb();
 	cq_tail_advance(cq);
 
-	/*
-	 * this function now executes at SPDK thread context, we
-	 * might be triggering interrupts from vfio-user thread context so
-	 * check for race conditions.
-	 */
-	if (ctrlr_interrupt_enabled(ctrlr) && cq->ien) {
+	if ((cq->qid == 0 || !ctrlr->adaptive_irqs_enabled) &&
+	    cq->ien && ctrlr_interrupt_enabled(ctrlr)) {
 		err = vfu_irq_trigger(ctrlr->endpoint->vfu_ctx, cq->iv);
 		if (err != 0) {
 			SPDK_ERRLOG("%s: failed to trigger interrupt: %m\n",
@@ -1148,32 +1662,6 @@ post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_cq *cq
 	}
 
 	return 0;
-}
-
-static bool
-io_q_exists(struct nvmf_vfio_user_ctrlr *vu_ctrlr, const uint16_t qid, const bool is_cq)
-{
-	assert(vu_ctrlr != NULL);
-
-	if (qid == 0 || qid >= NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR) {
-		return false;
-	}
-
-	if (is_cq) {
-		if (vu_ctrlr->cqs[qid] == NULL) {
-			return false;
-		}
-
-		return (vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_DELETED &&
-			vu_ctrlr->cqs[qid]->cq_state != VFIO_USER_CQ_UNUSED);
-	}
-
-	if (vu_ctrlr->sqs[qid] == NULL) {
-		return false;
-	}
-
-	return (vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_DELETED &&
-		vu_ctrlr->sqs[qid]->sq_state != VFIO_USER_SQ_UNUSED);
 }
 
 static void
@@ -1196,7 +1684,7 @@ delete_sq_done(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *
 	struct nvmf_vfio_user_cq *cq;
 	uint16_t cqid;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete SQ%d=%p done\n", ctrlr_id(vu_ctrlr),
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete sqid:%d=%p done\n", ctrlr_id(vu_ctrlr),
 		      sq->qid, sq);
 
 	/* Free SQ resources */
@@ -1216,7 +1704,7 @@ delete_sq_done(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *
 		cqid = sq->cqid;
 		cq = vu_ctrlr->cqs[cqid];
 
-		SPDK_DEBUGLOG(nvmf_vfio, "%s: try to delete CQ%d=%p\n", ctrlr_id(vu_ctrlr),
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: try to delete cqid:%u=%p\n", ctrlr_id(vu_ctrlr),
 			      cq->qid, cq);
 
 		if (cq->cq_ref) {
@@ -1255,7 +1743,7 @@ free_qp(struct nvmf_vfio_user_ctrlr *ctrlr, uint16_t qid)
 
 	cq = ctrlr->cqs[qid];
 	if (cq) {
-		SPDK_DEBUGLOG(nvmf_vfio, "%s: Free CQ %u\n", ctrlr_id(ctrlr), qid);
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: Free cqid:%u\n", ctrlr_id(ctrlr), qid);
 		unmap_q(ctrlr, &cq->mapping);
 		free(cq->mapping.sg);
 		free(cq);
@@ -1340,6 +1828,7 @@ alloc_sq_reqs(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *s
 		req->qpair = &sq->qpair;
 		req->rsp = (union nvmf_c2h_msg *)&vu_req->rsp;
 		req->cmd = (union nvmf_h2c_msg *)&vu_req->cmd;
+		req->stripped_data = NULL;
 
 		TAILQ_INSERT_TAIL(&sq->free_reqs, vu_req, link);
 	}
@@ -1351,6 +1840,14 @@ err:
 		free(vu_req);
 	}
 	return -ENOMEM;
+}
+
+static volatile uint32_t *
+ctrlr_doorbell_ptr(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	return ctrlr->sdbl != NULL ?
+	       ctrlr->sdbl->shadow_doorbells :
+	       ctrlr->bar0_doorbells;
 }
 
 static uint16_t
@@ -1377,14 +1874,14 @@ handle_create_io_sq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	}
 
 	if (cqid == 0 || cqid >= vu_transport->transport.opts.max_qpairs_per_ctrlr) {
-		SPDK_ERRLOG("%s: invalid CQID %u\n", ctrlr_id(ctrlr), cqid);
+		SPDK_ERRLOG("%s: invalid cqid:%u\n", ctrlr_id(ctrlr), cqid);
 		*sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		return SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 	}
 
 	/* CQ must be created before SQ. */
 	if (!io_q_exists(ctrlr, cqid, true)) {
-		SPDK_ERRLOG("%s: CQ%u does not exist\n", ctrlr_id(ctrlr), cqid);
+		SPDK_ERRLOG("%s: cqid:%u does not exist\n", ctrlr_id(ctrlr), cqid);
 		*sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		return SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
 	}
@@ -1398,7 +1895,7 @@ handle_create_io_sq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	sq = ctrlr->sqs[qid];
 	sq->size = qsize;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: SQ%d CQID=%d\n", ctrlr_id(ctrlr),
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: sqid:%d cqid:%d\n", ctrlr_id(ctrlr),
 		      qid, cqid);
 
 	sq->mapping.prp1 = cmd->dptr.prp.prp1;
@@ -1410,7 +1907,7 @@ handle_create_io_sq(struct nvmf_vfio_user_ctrlr *ctrlr,
 		return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: mapped SQ%d IOVA=%#lx vaddr=%p\n",
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: mapped sqid:%d IOVA=%#lx vaddr=%p\n",
 		      ctrlr_id(ctrlr), qid, cmd->dptr.prp.prp1,
 		      q_addr(&sq->mapping));
 
@@ -1425,7 +1922,32 @@ handle_create_io_sq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	ctrlr->cqs[sq->cqid]->cq_ref++;
 	sq->sq_state = VFIO_USER_SQ_CREATED;
 	*sq_headp(sq) = 0;
-	*sq_dbl_tailp(ctrlr, sq) = 0;
+
+	sq->dbl_tailp = ctrlr_doorbell_ptr(ctrlr) + queue_index(qid, false);
+
+	/*
+	 * We should always reset the doorbells.
+	 *
+	 * The Specification prohibits the controller from writing to the shadow
+	 * doorbell buffer, however older versions of the Linux NVMe driver
+	 * don't reset the shadow doorbell buffer after a Queue-Level or
+	 * Controller-Level reset, which means that we're left with garbage
+	 * doorbell values.
+	 */
+	*sq_dbl_tailp(sq) = 0;
+
+	if (ctrlr->sdbl != NULL) {
+		sq->need_rearm = true;
+
+		if (!set_sq_eventidx(sq)) {
+			SPDK_ERRLOG("%s: host updated SQ tail doorbell before "
+				    "sqid:%hu was initialized\n",
+				    ctrlr_id(ctrlr), qid);
+			fail_ctrlr(ctrlr);
+			*sct = SPDK_NVME_SCT_GENERIC;
+			return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		}
+	}
 
 	/*
 	 * Create our new I/O qpair. This asynchronously invokes, on a suitable
@@ -1481,6 +2003,8 @@ handle_create_io_cq(struct nvmf_vfio_user_ctrlr *ctrlr,
 
 	cq->mapping.prp1 = cmd->dptr.prp.prp1;
 
+	cq->dbl_headp = ctrlr_doorbell_ptr(ctrlr) + queue_index(qid, true);
+
 	err = map_q(ctrlr, &cq->mapping, cq->size, true, true);
 	if (err) {
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr_id(ctrlr));
@@ -1488,7 +2012,7 @@ handle_create_io_cq(struct nvmf_vfio_user_ctrlr *ctrlr,
 		return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: mapped CQ%d IOVA=%#lx vaddr=%p\n",
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: mapped cqid:%u IOVA=%#lx vaddr=%p\n",
 		      ctrlr_id(ctrlr), qid, cmd->dptr.prp.prp1,
 		      q_addr(&cq->mapping));
 
@@ -1498,7 +2022,17 @@ handle_create_io_cq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	cq->cq_state = VFIO_USER_CQ_CREATED;
 
 	*cq_tailp(cq) = 0;
-	*cq_dbl_headp(ctrlr, cq) = 0;
+
+	/*
+	 * We should always reset the doorbells.
+	 *
+	 * The Specification prohibits the controller from writing to the shadow
+	 * doorbell buffer, however older versions of the Linux NVMe driver
+	 * don't reset the shadow doorbell buffer after a Queue-Level or
+	 * Controller-Level reset, which means that we're left with garbage
+	 * doorbell values.
+	 */
+	*cq_dbl_headp(cq) = 0;
 
 	*sct = SPDK_NVME_SCT_GENERIC;
 	return SPDK_NVME_SC_SUCCESS;
@@ -1523,7 +2057,7 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 
 	qid = cmd->cdw10_bits.create_io_q.qid;
 	if (qid == 0 || qid >= vu_transport->transport.opts.max_qpairs_per_ctrlr) {
-		SPDK_ERRLOG("%s: invalid QID=%d, max=%d\n", ctrlr_id(ctrlr),
+		SPDK_ERRLOG("%s: invalid qid=%d, max=%d\n", ctrlr_id(ctrlr),
 			    qid, vu_transport->transport.opts.max_qpairs_per_ctrlr);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
@@ -1531,8 +2065,8 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	}
 
 	if (io_q_exists(ctrlr, qid, is_cq)) {
-		SPDK_ERRLOG("%s: %cQ%d already exists\n", ctrlr_id(ctrlr),
-			    is_cq ? 'C' : 'S', qid);
+		SPDK_ERRLOG("%s: %cqid:%d already exists\n", ctrlr_id(ctrlr),
+			    is_cq ? 'c' : 's', qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
@@ -1594,13 +2128,13 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	struct nvmf_vfio_user_cq *cq;
 	struct vfio_user_delete_sq_ctx *ctx;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete I/O %cQ: QID=%d\n",
-		      ctrlr_id(ctrlr), is_cq ? 'C' : 'S',
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: delete I/O %cqid:%d\n",
+		      ctrlr_id(ctrlr), is_cq ? 'c' : 's',
 		      cmd->cdw10_bits.delete_io_q.qid);
 
 	if (!io_q_exists(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq)) {
-		SPDK_ERRLOG("%s: I/O %cQ%d does not exist\n", ctrlr_id(ctrlr),
-			    is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
+		SPDK_ERRLOG("%s: I/O %cqid:%d does not exist\n", ctrlr_id(ctrlr),
+			    is_cq ? 'c' : 's', cmd->cdw10_bits.delete_io_q.qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
@@ -1643,8 +2177,129 @@ out:
 }
 
 /*
- * Returns 0 on success and -errno on error.
+ * Configures Shadow Doorbells.
  */
+static int
+handle_doorbell_buffer_config(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
+{
+	struct nvmf_vfio_user_shadow_doorbells *sdbl = NULL;
+	uint32_t dstrd;
+	uintptr_t page_size, page_mask;
+	uint64_t prp1, prp2;
+	uint16_t sct = SPDK_NVME_SCT_GENERIC;
+	uint16_t sc = SPDK_NVME_SC_INVALID_FIELD;
+
+	assert(ctrlr != NULL);
+	assert(ctrlr->endpoint != NULL);
+	assert(cmd != NULL);
+
+	dstrd = doorbell_stride(ctrlr);
+	page_size = memory_page_size(ctrlr);
+	page_mask = memory_page_mask(ctrlr);
+
+	/* FIXME: we don't check doorbell stride when setting queue doorbells. */
+	if ((4u << dstrd) * NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR > page_size) {
+		SPDK_ERRLOG("%s: doorbells do not fit in a single host page",
+			    ctrlr_id(ctrlr));
+
+		goto out;
+	}
+
+	/* Verify guest physical addresses passed as PRPs. */
+	if (cmd->psdt != SPDK_NVME_PSDT_PRP) {
+		SPDK_ERRLOG("%s: received Doorbell Buffer Config without PRPs",
+			    ctrlr_id(ctrlr));
+
+		goto out;
+	}
+
+	prp1 = cmd->dptr.prp.prp1;
+	prp2 = cmd->dptr.prp.prp2;
+
+	SPDK_DEBUGLOG(nvmf_vfio,
+		      "%s: configuring shadow doorbells with PRP1=%#lx and PRP2=%#lx (GPAs)\n",
+		      ctrlr_id(ctrlr), prp1, prp2);
+
+	if (prp1 == prp2
+	    || prp1 != (prp1 & page_mask)
+	    || prp2 != (prp2 & page_mask)) {
+		SPDK_ERRLOG("%s: invalid shadow doorbell GPAs\n",
+			    ctrlr_id(ctrlr));
+
+		goto out;
+	}
+
+	/* Map guest physical addresses to our virtual address space. */
+	sdbl = map_sdbl(ctrlr->endpoint->vfu_ctx, prp1, prp2, page_size);
+	if (sdbl == NULL) {
+		SPDK_ERRLOG("%s: failed to map shadow doorbell buffers\n",
+			    ctrlr_id(ctrlr));
+
+		goto out;
+	}
+
+	ctrlr->shadow_doorbell_buffer = prp1;
+	ctrlr->eventidx_buffer = prp2;
+
+	SPDK_DEBUGLOG(nvmf_vfio,
+		      "%s: mapped shadow doorbell buffers [%p, %p) and [%p, %p)\n",
+		      ctrlr_id(ctrlr),
+		      sdbl->iovs[0].iov_base,
+		      sdbl->iovs[0].iov_base + sdbl->iovs[0].iov_len,
+		      sdbl->iovs[1].iov_base,
+		      sdbl->iovs[1].iov_base + sdbl->iovs[1].iov_len);
+
+
+	/*
+	 * Set all possible CQ head doorbells to polling mode now, such that we
+	 * don't have to worry about it later if the host creates more queues.
+	 *
+	 * We only ever want interrupts for writes to the SQ tail doorbells
+	 * (which are initialised in set_ctrlr_intr_mode() below).
+	 */
+	for (uint16_t i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; ++i) {
+		sdbl->eventidxs[queue_index(i, true)] = NVMF_VFIO_USER_EVENTIDX_POLL;
+		if (ctrlr->sqs[i] != NULL) {
+			ctrlr->sqs[i]->need_rearm = true;
+		}
+	}
+
+	/* Update controller. */
+	SWAP(ctrlr->sdbl, sdbl);
+
+	/*
+	 * Copy doorbells from either the previous shadow doorbell buffer or the
+	 * BAR0 doorbells and make I/O queue doorbells point to the new buffer.
+	 *
+	 * This needs to account for older versions of the Linux NVMe driver,
+	 * which don't clear out the buffer after a controller reset.
+	 */
+	copy_doorbells(ctrlr, sdbl != NULL ?
+		       sdbl->shadow_doorbells : ctrlr->bar0_doorbells,
+		       ctrlr->sdbl->shadow_doorbells);
+	vfio_user_ctrlr_switch_doorbells(ctrlr, true);
+
+	/* Update event index buffer and poll queues if necessary. */
+	set_ctrlr_intr_mode(ctrlr);
+
+	sc = SPDK_NVME_SC_SUCCESS;
+
+out:
+	/*
+	 * Unmap existing buffers, in case Doorbell Buffer Config was sent
+	 * more than once (pointless, but not prohibited by the spec), or
+	 * in case of an error.
+	 *
+	 * If this is the first time Doorbell Buffer Config was processed,
+	 * then we've just swapped a NULL from ctrlr->sdbl into sdbl, so
+	 * free_sdbl() becomes a noop.
+	 */
+	free_sdbl(ctrlr->endpoint->vfu_ctx, sdbl);
+
+	return post_completion(ctrlr, ctrlr->cqs[0], 0, 0, cmd->cid, sc, sct);
+}
+
+/* Returns 0 on success and -errno on error. */
 static int
 consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
@@ -1667,6 +2322,11 @@ consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	case SPDK_NVME_OPC_DELETE_IO_CQ:
 		return handle_del_io_q(ctrlr, cmd,
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
+	case SPDK_NVME_OPC_DOORBELL_BUFFER_CONFIG:
+		if (!ctrlr->transport->transport_opts.disable_shadow_doorbells) {
+			return handle_doorbell_buffer_config(ctrlr, cmd);
+		}
+	/* FALLTHROUGH */
 	default:
 		return handle_cmd_req(ctrlr, cmd, ctrlr->sqs[0]);
 	}
@@ -1722,6 +2382,12 @@ handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail
 	assert(ctrlr != NULL);
 	assert(sq != NULL);
 
+	/*
+	 * Submission queue index has moved past the event index, so it needs to
+	 * be re-armed before we go to sleep.
+	 */
+	sq->need_rearm = true;
+
 	queue = q_addr(&sq->mapping);
 	while (*sq_headp(sq) != new_tail) {
 		int err;
@@ -1742,41 +2408,6 @@ handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail
 	}
 
 	return count;
-}
-
-static int
-enable_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-
-	err = acq_setup(ctrlr);
-	if (err != 0) {
-		return err;
-	}
-
-	err = asq_setup(ctrlr);
-	if (err != 0) {
-		return err;
-	}
-
-	return 0;
-}
-
-static void
-disable_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
-{
-	assert(ctrlr->sqs[0] != NULL);
-	assert(ctrlr->cqs[0] != NULL);
-
-	unmap_q(ctrlr, &ctrlr->sqs[0]->mapping);
-	unmap_q(ctrlr, &ctrlr->cqs[0]->mapping);
-
-	ctrlr->sqs[0]->size = 0;
-	*sq_headp(ctrlr->sqs[0]) = 0;
-	ctrlr->cqs[0]->size = 0;
-	*cq_dbl_headp(ctrlr, ctrlr->cqs[0]) = 0;
 }
 
 static void
@@ -1839,7 +2470,7 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 		if (cq->size && q_addr(&cq->mapping) == NULL) {
 			ret = map_q(ctrlr, &cq->mapping, cq->size, true, false);
 			if (ret) {
-				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx\n",
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap cqid:%d %#lx-%#lx\n",
 					      cq->qid, cq->mapping.prp1,
 					      cq->mapping.prp1 + cq->size * sizeof(struct spdk_nvme_cpl));
 				continue;
@@ -1849,14 +2480,14 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 		if (sq->size) {
 			ret = map_q(ctrlr, &sq->mapping, sq->size, false, false);
 			if (ret) {
-				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx\n",
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap sqid:%d %#lx-%#lx\n",
 					      sq->qid, sq->mapping.prp1,
 					      sq->mapping.prp1 + sq->size * sizeof(struct spdk_nvme_cmd));
 				continue;
 			}
 		}
 		sq->sq_state = VFIO_USER_SQ_ACTIVE;
-		SPDK_DEBUGLOG(nvmf_vfio, "Remap SQ %u successfully\n", sq->qid);
+		SPDK_DEBUGLOG(nvmf_vfio, "Remap sqid:%u successfully\n", sq->qid);
 	}
 	pthread_mutex_unlock(&endpoint->lock);
 }
@@ -1904,6 +2535,25 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 				unmap_q(ctrlr, &cq->mapping);
 			}
 		}
+
+		if (ctrlr->sdbl != NULL) {
+			size_t i;
+
+			for (i = 0; i < NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT; i++) {
+				const void *const iov_base = ctrlr->sdbl->iovs[i].iov_base;
+
+				if (iov_base >= map_start && iov_base < map_end) {
+					copy_doorbells(ctrlr,
+						       ctrlr->sdbl->shadow_doorbells,
+						       ctrlr->bar0_doorbells);
+					vfio_user_ctrlr_switch_doorbells(ctrlr, false);
+					free_sdbl(endpoint->vfu_ctx, ctrlr->sdbl);
+					ctrlr->sdbl = NULL;
+					break;
+				}
+			}
+		}
+
 		pthread_mutex_unlock(&endpoint->lock);
 	}
 
@@ -1914,6 +2564,66 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 				    map_start, map_end, ret);
 		}
 	}
+}
+
+/* Used to initiate a controller-level reset or a controller shutdown. */
+static void
+disable_ctrlr(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: disabling controller\n",
+		      ctrlr_id(vu_ctrlr));
+
+	/* Unmap Admin queue. */
+
+	assert(vu_ctrlr->sqs[0] != NULL);
+	assert(vu_ctrlr->cqs[0] != NULL);
+
+	unmap_q(vu_ctrlr, &vu_ctrlr->sqs[0]->mapping);
+	unmap_q(vu_ctrlr, &vu_ctrlr->cqs[0]->mapping);
+
+	vu_ctrlr->sqs[0]->size = 0;
+	*sq_headp(vu_ctrlr->sqs[0]) = 0;
+
+	vu_ctrlr->sqs[0]->sq_state = VFIO_USER_SQ_INACTIVE;
+
+	vu_ctrlr->cqs[0]->size = 0;
+	*cq_tailp(vu_ctrlr->cqs[0]) = 0;
+
+	/*
+	 * For PCIe controller reset or shutdown, we will drop all AER
+	 * responses.
+	 */
+	nvmf_ctrlr_abort_aer(vu_ctrlr->ctrlr);
+
+	/* Free the shadow doorbell buffer. */
+	free_sdbl(vu_ctrlr->endpoint->vfu_ctx, vu_ctrlr->sdbl);
+	vu_ctrlr->sdbl = NULL;
+}
+
+/* Used to re-enable the controller after a controller-level reset. */
+static int
+enable_ctrlr(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	int err;
+
+	assert(vu_ctrlr != NULL);
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: enabling controller\n",
+		      ctrlr_id(vu_ctrlr));
+
+	err = acq_setup(vu_ctrlr);
+	if (err != 0) {
+		return err;
+	}
+
+	err = asq_setup(vu_ctrlr);
+	if (err != 0) {
+		return err;
+	}
+
+	vu_ctrlr->sqs[0]->sq_state = VFIO_USER_SQ_ACTIVE;
+
+	return 0;
 }
 
 static int
@@ -1946,13 +2656,11 @@ nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 
 			if (diff.bits.en) {
 				if (cc.bits.en) {
-					SPDK_DEBUGLOG(nvmf_vfio, "%s: MAP Admin queue\n", ctrlr_id(vu_ctrlr));
-					ret = enable_admin_queue(vu_ctrlr);
+					ret = enable_ctrlr(vu_ctrlr);
 					if (ret) {
-						SPDK_ERRLOG("%s: failed to map Admin queue\n", ctrlr_id(vu_ctrlr));
+						SPDK_ERRLOG("%s: failed to enable ctrlr\n", ctrlr_id(vu_ctrlr));
 						return ret;
 					}
-					sq->sq_state = VFIO_USER_SQ_ACTIVE;
 					vu_ctrlr->reset_shn = false;
 				} else {
 					vu_ctrlr->reset_shn = true;
@@ -1966,13 +2674,7 @@ nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 			}
 
 			if (vu_ctrlr->reset_shn) {
-				SPDK_DEBUGLOG(nvmf_vfio,
-					      "%s: UNMAP Admin queue\n",
-					      ctrlr_id(vu_ctrlr));
-				sq->sq_state = VFIO_USER_SQ_INACTIVE;
-				disable_admin_queue(vu_ctrlr);
-				/* For PCIe controller reset or shutdown, we will drop all AER responses */
-				nvmf_ctrlr_abort_aer(vu_ctrlr->ctrlr);
+				disable_ctrlr(vu_ctrlr);
 			}
 		}
 	}
@@ -1993,6 +2695,13 @@ handle_dbl_access(struct nvmf_vfio_user_ctrlr *ctrlr, uint32_t *buf,
 {
 	assert(ctrlr != NULL);
 	assert(buf != NULL);
+
+	if (!is_write) {
+		SPDK_WARNLOG("%s: host tried to read BAR0 doorbell %#lx\n",
+			     ctrlr_id(ctrlr), pos);
+		errno = EPERM;
+		return -1;
+	}
 
 	if (count != sizeof(uint32_t)) {
 		SPDK_ERRLOG("%s: bad doorbell buffer size %ld\n",
@@ -2019,13 +2728,14 @@ handle_dbl_access(struct nvmf_vfio_user_ctrlr *ctrlr, uint32_t *buf,
 		return -1;
 	}
 
-	if (is_write) {
-		ctrlr->doorbells[pos] = *buf;
-		spdk_wmb();
-	} else {
-		spdk_rmb();
-		*buf = ctrlr->doorbells[pos];
-	}
+	ctrlr->bar0_doorbells[pos] = *buf;
+	spdk_wmb();
+
+	SPDK_DEBUGLOG(vfio_user_db, "%s: updating BAR0 doorbell %s:%ld to %u\n",
+		      ctrlr_id(ctrlr), (pos & 1) ? "cqid" : "sqid",
+		      pos / 2, *buf);
+
+
 	return 0;
 }
 
@@ -2036,6 +2746,11 @@ vfio_user_property_access(struct nvmf_vfio_user_ctrlr *vu_ctrlr,
 {
 	struct nvmf_vfio_user_req *req;
 	const struct spdk_nvmf_registers *regs;
+
+	if ((count != 4) && (count != 8)) {
+		errno = EINVAL;
+		return -1;
+	}
 
 	/* Construct a Fabric Property Get/Set command and send it */
 	req = get_nvmf_vfio_user_req(vu_ctrlr->sqs[0]);
@@ -2050,7 +2765,11 @@ vfio_user_property_access(struct nvmf_vfio_user_ctrlr *vu_ctrlr,
 	req->cb_arg = vu_ctrlr->sqs[0];
 	req->req.cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 	req->req.cmd->prop_set_cmd.cid = 0;
-	req->req.cmd->prop_set_cmd.attrib.size = (count / 4) - 1;
+	if (count == 4) {
+		req->req.cmd->prop_set_cmd.attrib.size = 0;
+	} else {
+		req->req.cmd->prop_set_cmd.attrib.size = 1;
+	}
 	req->req.cmd->prop_set_cmd.ofst = pos;
 	if (is_write) {
 		req->req.cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
@@ -2084,11 +2803,6 @@ access_bar0_fn(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t pos,
 		errno = EIO;
 		return -1;
 	}
-
-	SPDK_DEBUGLOG(nvmf_vfio,
-		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-		      endpoint_id(endpoint), is_write ? "write" : "read",
-		      ctrlr, count, pos);
 
 	if (pos >= NVME_DOORBELLS_OFFSET) {
 		/*
@@ -2186,23 +2900,23 @@ init_pci_config_space(vfu_pci_config_space_t *p)
 	p->hdr.intr.ipin = 0x1;
 }
 
+struct subsystem_pause_ctx {
+	struct nvmf_vfio_user_ctrlr *ctrlr;
+	int status;
+};
+
 static void
 vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
 			   void *cb_arg, int status);
 
 static void
-vfio_user_endpoint_resume_done(struct spdk_nvmf_subsystem *subsystem,
-			       void *cb_arg, int status)
+_vfio_user_endpoint_resume_done_msg(void *ctx)
 {
-	struct nvmf_vfio_user_endpoint *endpoint = cb_arg;
+	struct nvmf_vfio_user_endpoint *endpoint = ctx;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr = endpoint->ctrlr;
 	int ret;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s resumed done with status %d\n", endpoint_id(endpoint), status);
-
-	if (!vu_ctrlr) {
-		return;
-	}
+	endpoint->need_resume = false;
 	vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
 
 	/* Basically, once we call `vfu_device_quiesced` the device is unquiesced from
@@ -2225,19 +2939,34 @@ vfio_user_endpoint_resume_done(struct spdk_nvmf_subsystem *subsystem,
 }
 
 static void
-vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
-			   void *cb_arg, int status)
+vfio_user_endpoint_resume_done(struct spdk_nvmf_subsystem *subsystem,
+			       void *cb_arg, int status)
 {
-	struct nvmf_vfio_user_ctrlr *vu_ctrlr = cb_arg;
+	struct nvmf_vfio_user_endpoint *endpoint = cb_arg;
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = endpoint->ctrlr;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s resumed done with status %d\n", endpoint_id(endpoint), status);
+
+	if (!vu_ctrlr) {
+		return;
+	}
+
+	spdk_thread_send_msg(vu_ctrlr->thread, _vfio_user_endpoint_resume_done_msg, endpoint);
+}
+
+static void
+_vfio_user_dev_quiesce_done_msg(void *ctx)
+{
+	struct subsystem_pause_ctx *subsystem_ctx = ctx;
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = subsystem_ctx->ctrlr;
 	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
 	int ret;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s paused done with status %d\n", ctrlr_id(vu_ctrlr), status);
-
 	assert(vu_ctrlr->state == VFIO_USER_CTRLR_PAUSING);
 	vu_ctrlr->state = VFIO_USER_CTRLR_PAUSED;
-	vfu_device_quiesced(endpoint->vfu_ctx, status);
+	vfu_device_quiesced(endpoint->vfu_ctx, subsystem_ctx->status);
 	vu_ctrlr->queued_quiesce = false;
+	free(subsystem_ctx);
 
 	/* `vfu_device_quiesced` can change the migration state,
 	 * so we need to re-check `vu_ctrlr->state`.
@@ -2255,6 +2984,28 @@ vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
 		vu_ctrlr->state = VFIO_USER_CTRLR_PAUSED;
 		SPDK_ERRLOG("%s: failed to resume, ret=%d\n", endpoint_id(endpoint), ret);
 	}
+}
+
+static void
+vfio_user_dev_quiesce_done(struct spdk_nvmf_subsystem *subsystem,
+			   void *cb_arg, int status)
+{
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr = cb_arg;
+	struct subsystem_pause_ctx *ctx;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s paused done with status %d\n", ctrlr_id(vu_ctrlr), status);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Failed to allocate subsystem pause context\n");
+		assert(false);
+		return;
+	}
+
+	ctx->ctrlr = vu_ctrlr;
+	ctx->status = status;
+
+	spdk_thread_send_msg(vu_ctrlr->thread, _vfio_user_dev_quiesce_done_msg, ctx);
 }
 
 static int
@@ -2318,7 +3069,9 @@ vfio_user_dev_quiesce_cb(vfu_ctx_t *vfu_ctx)
 }
 
 static void
-vfio_user_ctrlr_dump_migr_data(const char *name, struct vfio_user_nvme_migr_state *migr_data)
+vfio_user_ctrlr_dump_migr_data(const char *name,
+			       struct vfio_user_nvme_migr_state *migr_data,
+			       struct nvmf_vfio_user_shadow_doorbells *sdbl)
 {
 	struct spdk_nvme_registers *regs;
 	struct nvme_migr_sq_state *sq;
@@ -2341,19 +3094,39 @@ vfio_user_ctrlr_dump_migr_data(const char *name, struct vfio_user_nvme_migr_stat
 	SPDK_NOTICELOG("ACQ  0x%"PRIx64"\n", regs->acq);
 
 	SPDK_NOTICELOG("Number of IO Queues %u\n", migr_data->ctrlr_header.num_io_queues);
+
+	if (sdbl != NULL) {
+		SPDK_NOTICELOG("shadow doorbell buffer=%#lx\n",
+			       migr_data->ctrlr_header.shadow_doorbell_buffer);
+		SPDK_NOTICELOG("eventidx buffer=%#lx\n",
+			       migr_data->ctrlr_header.eventidx_buffer);
+	}
+
 	for (i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
 		sq = &migr_data->qps[i].sq;
 		cq = &migr_data->qps[i].cq;
 
 		if (sq->size) {
-			SPDK_NOTICELOG("SQID %u, SQ DOORBELL %u\n", sq->sqid, doorbell_base[i * 2]);
-			SPDK_NOTICELOG("SQ SQID %u, CQID %u, HEAD %u, SIZE %u, DMA ADDR 0x%"PRIx64"\n",
+			SPDK_NOTICELOG("sqid:%u, bar0_doorbell:%u\n", sq->sqid, doorbell_base[i * 2]);
+			if (i > 0 && sdbl != NULL) {
+				SPDK_NOTICELOG("sqid:%u, shadow_doorbell:%u, eventidx:%u\n",
+					       sq->sqid,
+					       sdbl->shadow_doorbells[queue_index(i, false)],
+					       sdbl->eventidxs[queue_index(i, false)]);
+			}
+			SPDK_NOTICELOG("SQ sqid:%u, cqid:%u, sqhead:%u, size:%u, dma_addr:0x%"PRIx64"\n",
 				       sq->sqid, sq->cqid, sq->head, sq->size, sq->dma_addr);
 		}
 
 		if (cq->size) {
-			SPDK_NOTICELOG("CQID %u, CQ DOORBELL %u\n", cq->cqid, doorbell_base[i * 2 + 1]);
-			SPDK_NOTICELOG("CQ CQID %u, PHASE %u, TAIL %u, SIZE %u, IV %u, IEN %u, DMA ADDR 0x%"PRIx64"\n",
+			SPDK_NOTICELOG("cqid:%u, bar0_doorbell:%u\n", cq->cqid, doorbell_base[i * 2 + 1]);
+			if (i > 0 && sdbl != NULL) {
+				SPDK_NOTICELOG("cqid:%u, shadow_doorbell:%u, eventidx:%u\n",
+					       cq->cqid,
+					       sdbl->shadow_doorbells[queue_index(i, true)],
+					       sdbl->eventidxs[queue_index(i, true)]);
+			}
+			SPDK_NOTICELOG("CQ cqid:%u, phase:%u, cqtail:%u, size:%u, iv:%u, ien:%u, dma_addr:0x%"PRIx64"\n",
 				       cq->cqid, cq->phase, cq->tail, cq->size, cq->iv, cq->ien, cq->dma_addr);
 		}
 	}
@@ -2465,7 +3238,7 @@ vfio_user_migr_ctrlr_save_data(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 	regs->acq = ctrlr->vcprop.acq;
 	/* Save doorbells */
 	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
-	memcpy(doorbell_base, (void *)vu_ctrlr->doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
+	memcpy(doorbell_base, (void *)vu_ctrlr->bar0_doorbells, NVMF_VFIO_USER_DOORBELLS_SIZE);
 
 	/* Save PCI configuration space */
 	memcpy(&migr_state.cfg, (void *)endpoint->pci_config_space, NVME_REG_CFG_SIZE);
@@ -2502,11 +3275,18 @@ vfio_user_migr_ctrlr_save_data(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 	migr_state.ctrlr_header.bar_len[VFU_PCI_DEV_CFG_REGION_IDX] = NVME_REG_CFG_SIZE;
 	memcpy(data_ptr, &migr_state.cfg, NVME_REG_CFG_SIZE);
 
+	/* copy shadow doorbells */
+	if (vu_ctrlr->sdbl != NULL) {
+		migr_state.ctrlr_header.sdbl = true;
+		migr_state.ctrlr_header.shadow_doorbell_buffer = vu_ctrlr->shadow_doorbell_buffer;
+		migr_state.ctrlr_header.eventidx_buffer = vu_ctrlr->eventidx_buffer;
+	}
+
 	/* Copy nvme migration header finally */
 	memcpy(endpoint->migr_data, &migr_state.ctrlr_header, sizeof(struct vfio_user_nvme_migr_header));
 
 	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf_vfio")) {
-		vfio_user_ctrlr_dump_migr_data("SAVE", &migr_state);
+		vfio_user_ctrlr_dump_migr_data("SAVE", &migr_state, vu_ctrlr->sdbl);
 	}
 }
 
@@ -2530,6 +3310,12 @@ vfio_user_device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 		return 0;
 	}
 
+	/* FIXME: LOST_CONN case ? */
+	if (ctrlr->sdbl != NULL) {
+		free_sdbl(vfu_ctx, ctrlr->sdbl);
+		ctrlr->sdbl = NULL;
+	}
+
 	/* FIXME: much more needed here. */
 
 	return 0;
@@ -2547,7 +3333,7 @@ vfio_user_migr_ctrlr_construct_qps(struct nvmf_vfio_user_ctrlr *vu_ctrlr,
 	int ret;
 
 	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf_vfio")) {
-		vfio_user_ctrlr_dump_migr_data("RESUME", migr_state);
+		vfio_user_ctrlr_dump_migr_data("RESUME", migr_state, vu_ctrlr->sdbl);
 	}
 
 	/* restore submission queues */
@@ -2666,6 +3452,25 @@ vfio_user_migr_ctrlr_restore(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 		return rc;
 	}
 
+	/* restore shadow doorbells */
+	if (migr_state.ctrlr_header.sdbl) {
+		struct nvmf_vfio_user_shadow_doorbells *sdbl;
+		sdbl = map_sdbl(vu_ctrlr->endpoint->vfu_ctx,
+				migr_state.ctrlr_header.shadow_doorbell_buffer,
+				migr_state.ctrlr_header.eventidx_buffer,
+				memory_page_size(vu_ctrlr));
+		if (sdbl == NULL) {
+			SPDK_ERRLOG("%s: failed to re-map shadow doorbell buffers\n",
+				    ctrlr_id(vu_ctrlr));
+			return -1;
+		}
+
+		vu_ctrlr->shadow_doorbell_buffer = migr_state.ctrlr_header.shadow_doorbell_buffer;
+		vu_ctrlr->eventidx_buffer = migr_state.ctrlr_header.eventidx_buffer;
+
+		SWAP(vu_ctrlr->sdbl, sdbl);
+	}
+
 	rc = vfio_user_migr_ctrlr_construct_qps(vu_ctrlr, &migr_state);
 	if (rc) {
 		return rc;
@@ -2677,7 +3482,7 @@ vfio_user_migr_ctrlr_restore(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 	regs = (struct spdk_nvme_registers *)&migr_state.bar0;
 	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
 	/* restore doorbells from saved registers */
-	memcpy((void *)vu_ctrlr->doorbells, doorbell_base, NVMF_VFIO_USER_DOORBELLS_SIZE);
+	memcpy((void *)vu_ctrlr->bar0_doorbells, doorbell_base, NVMF_VFIO_USER_DOORBELLS_SIZE);
 
 	/* restore controller registers after ADMIN queue connection */
 	ctrlr->vcprop.csts.raw = regs->csts.raw;
@@ -2716,6 +3521,20 @@ vfio_user_migr_ctrlr_enable_sqs(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
 	uint32_t i;
 	struct nvmf_vfio_user_sq *sq;
 
+	/* The Admin queue (qid: 0) does not ever use shadow doorbells. */
+
+	if (vu_ctrlr->sqs[0] != NULL) {
+		vu_ctrlr->sqs[0]->dbl_tailp = vu_ctrlr->bar0_doorbells +
+					      queue_index(0, false);
+	}
+
+	if (vu_ctrlr->cqs[0] != NULL) {
+		vu_ctrlr->cqs[0]->dbl_headp = vu_ctrlr->bar0_doorbells +
+					      queue_index(0, true);
+	}
+
+	vfio_user_ctrlr_switch_doorbells(vu_ctrlr, vu_ctrlr->sdbl != NULL);
+
 	for (i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
 		sq = vu_ctrlr->sqs[i];
 		if (!sq || !sq->size) {
@@ -2749,6 +3568,13 @@ vfio_user_migration_device_state_transition(vfu_ctx_t *vfu_ctx, vfu_migr_state_t
 		break;
 	case VFU_MIGR_STATE_STOP:
 		vu_ctrlr->state = VFIO_USER_CTRLR_MIGRATING;
+		/* The controller associates with source VM is dead now, we will resume
+		 * the subsystem after destroying the controller data structure, then the
+		 * subsystem can be re-used for another new client.
+		 */
+		if (vu_ctrlr->in_source_vm) {
+			endpoint->need_resume = true;
+		}
 		break;
 	case VFU_MIGR_STATE_PRE_COPY:
 		assert(vu_ctrlr->state == VFIO_USER_CTRLR_PAUSED);
@@ -2791,6 +3617,8 @@ vfio_user_migration_device_state_transition(vfu_ctx_t *vfu_ctx, vfu_migr_state_t
 			if (ret) {
 				break;
 			}
+
+			vfio_user_ctrlr_switch_doorbells(vu_ctrlr, false);
 			vfio_user_migr_ctrlr_enable_sqs(vu_ctrlr);
 			vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
 		} else {
@@ -3117,6 +3945,8 @@ _free_ctrlr(void *ctx)
 	struct nvmf_vfio_user_ctrlr *ctrlr = ctx;
 	struct nvmf_vfio_user_endpoint *endpoint = ctrlr->endpoint;
 
+	free_sdbl(ctrlr->endpoint->vfu_ctx, ctrlr->sdbl);
+
 	spdk_interrupt_unregister(&ctrlr->intr);
 	ctrlr->intr_fd = -1;
 	spdk_poller_unregister(&ctrlr->vfu_ctx_poller);
@@ -3170,8 +4000,11 @@ nvmf_vfio_user_create_ctrlr(struct nvmf_vfio_user_transport *transport,
 	ctrlr->intr_fd = -1;
 	ctrlr->transport = transport;
 	ctrlr->endpoint = endpoint;
-	ctrlr->doorbells = endpoint->doorbells;
+	ctrlr->bar0_doorbells = endpoint->bar0_doorbells;
 	TAILQ_INIT(&ctrlr->connected_sqs);
+
+	ctrlr->adaptive_irqs_enabled =
+		!transport->transport_opts.disable_adaptive_irq;
 
 	/* Then, construct an admin queue pair */
 	err = init_sq(ctrlr, &transport->transport, 0);
@@ -3254,6 +4087,7 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 			    endpoint_id(endpoint), path, spdk_strerror(errno));
 		goto out;
 	}
+	unlink(path);
 
 	endpoint->devmem_fd = ret;
 	ret = ftruncate(endpoint->devmem_fd,
@@ -3264,11 +4098,11 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	endpoint->doorbells = mmap(NULL, NVMF_VFIO_USER_DOORBELLS_SIZE,
-				   PROT_READ | PROT_WRITE, MAP_SHARED, endpoint->devmem_fd, NVME_DOORBELLS_OFFSET);
-	if (endpoint->doorbells == MAP_FAILED) {
+	endpoint->bar0_doorbells = mmap(NULL, NVMF_VFIO_USER_DOORBELLS_SIZE,
+					PROT_READ | PROT_WRITE, MAP_SHARED, endpoint->devmem_fd, NVME_DOORBELLS_OFFSET);
+	if (endpoint->bar0_doorbells == MAP_FAILED) {
 		SPDK_ERRLOG("%s: error to mmap file %s: %s.\n", endpoint_id(endpoint), path, spdk_strerror(errno));
-		endpoint->doorbells = NULL;
+		endpoint->bar0_doorbells = NULL;
 		ret = -1;
 		goto out;
 	}
@@ -3286,6 +4120,7 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 			    endpoint_id(endpoint), path, spdk_strerror(errno));
 		goto out;
 	}
+	unlink(path);
 
 	endpoint->migr_fd = ret;
 	ret = ftruncate(endpoint->migr_fd,
@@ -3392,6 +4227,10 @@ nvmf_vfio_user_cdata_init(struct spdk_nvmf_transport *transport,
 			  struct spdk_nvmf_subsystem *subsystem,
 			  struct spdk_nvmf_ctrlr_data *cdata)
 {
+	struct nvmf_vfio_user_transport *vu_transport;
+
+	vu_transport = SPDK_CONTAINEROF(transport, struct nvmf_vfio_user_transport, transport);
+
 	cdata->vid = SPDK_PCI_VID_NUTANIX;
 	cdata->ssvid = SPDK_PCI_VID_NUTANIX;
 	cdata->ieee[0] = 0x8d;
@@ -3401,6 +4240,7 @@ nvmf_vfio_user_cdata_init(struct spdk_nvmf_transport *transport,
 	cdata->sgls.supported = SPDK_NVME_SGLS_SUPPORTED_DWORD_ALIGNED;
 	/* libvfio-user can only support 1 connection for now */
 	cdata->oncs.reservations = 0;
+	cdata->oacs.doorbell_buffer_config = !vu_transport->transport_opts.disable_shadow_doorbells;
 }
 
 static int
@@ -3451,13 +4291,18 @@ nvmf_vfio_user_accept(void *ctx)
 		return SPDK_POLLER_IDLE;
 	}
 
-	err = vfu_attach_ctx(endpoint->vfu_ctx);
+	/* While we're here, the controller is already destroyed,
+	 * subsystem may still be in RESUMING state, we will wait
+	 * until the subsystem is in RUNNING state.
+	 */
+	if (endpoint->need_resume) {
+		return SPDK_POLLER_IDLE;
+	}
 
+	err = vfu_attach_ctx(endpoint->vfu_ctx);
 	if (err == 0) {
 		SPDK_DEBUGLOG(nvmf_vfio, "attach succeeded\n");
-
 		err = nvmf_vfio_user_create_ctrlr(vu_transport, endpoint);
-
 		if (err == 0) {
 			/*
 			 * Unregister ourselves: now we've accepted a
@@ -3468,7 +4313,6 @@ nvmf_vfio_user_accept(void *ctx)
 			spdk_interrupt_unregister(&endpoint->accept_intr);
 			spdk_poller_unregister(&endpoint->accept_poller);
 		}
-
 		return SPDK_POLLER_BUSY;
 	}
 
@@ -3543,6 +4387,13 @@ nvmf_vfio_user_poll_group_create(struct spdk_nvmf_transport *transport,
 	return &vu_group->group;
 }
 
+static bool
+in_interrupt_mode(struct nvmf_vfio_user_transport *vu_transport)
+{
+	return spdk_interrupt_mode_is_enabled() &&
+	       vu_transport->intr_mode_supported;
+}
+
 static struct spdk_nvmf_transport_poll_group *
 nvmf_vfio_user_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
 {
@@ -3577,10 +4428,9 @@ nvmf_vfio_user_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
 		/*
 		 * If we're in interrupt mode, align all qpairs for a controller
 		 * on the same poll group, to avoid complications in
-		 * vfio_user_handle_intr().
+		 * vfio_user_ctrlr_intr().
 		 */
-		if (spdk_interrupt_mode_is_enabled() &&
-		    vu_transport->intr_mode_supported) {
+		if (in_interrupt_mode(vu_transport)) {
 			result = sq->ctrlr->sqs[0]->group;
 			goto out;
 		}
@@ -3596,11 +4446,11 @@ nvmf_vfio_user_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
 		*vu_group = TAILQ_FIRST(&vu_transport->poll_groups);
 	}
 
+out:
 	if (cq->group == NULL) {
 		cq->group = result;
 	}
 
-out:
 	pthread_mutex_unlock(&vu_transport->pg_lock);
 	return result;
 }
@@ -3729,25 +4579,58 @@ _post_completion_msg(void *ctx)
 
 static int nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group);
 
+static int set_ctrlr_intr_mode(struct nvmf_vfio_user_ctrlr *ctrlr);
+
 static int
-vfio_user_handle_intr(void *ctx)
+vfio_user_ctrlr_intr(void *ctx)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr = ctx;
-	int ret;
+	int ret = 0;
 
 	assert(ctrlr != NULL);
 	assert(ctrlr->sqs[0] != NULL);
 	assert(ctrlr->sqs[0]->group != NULL);
 
+	ctrlr->self_kick_requested = false;
+
+	/*
+	 * Poll vfio-user for this controller.
+	 */
 	vfio_user_poll_vfu_ctx(ctrlr);
 
 	/*
-	 * See nvmf_vfio_user_get_optimal_poll_group() fo why it's OK to only
+	 * See nvmf_vfio_user_get_optimal_poll_group() for why it's OK to only
 	 * poll this poll group.
+	 *
+	 * Note that this could end up polling other controller's SQs as well
+	 * (since a single poll group can have SQs from multiple separate
+	 * controllers).
 	 */
-	ret = nvmf_vfio_user_poll_group_poll(ctrlr->sqs[0]->group);
+	ret |= nvmf_vfio_user_poll_group_poll(ctrlr->sqs[0]->group);
+
+	/* Re-arm the event indexes. */
+	ret |= set_ctrlr_intr_mode(ctrlr);
 
 	return ret != 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+static void
+vfio_user_set_intr_mode(struct spdk_poller *poller, void *arg,
+			bool interrupt_mode)
+{
+	struct nvmf_vfio_user_ctrlr *ctrlr = arg;
+	assert(ctrlr != NULL);
+	assert(ctrlr->endpoint != NULL);
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: setting interrupt mode to %d\n",
+		      ctrlr_id(ctrlr), interrupt_mode);
+
+	/*
+	 * interrupt_mode needs to persist across controller resets, so store
+	 * it in the endpoint instead.
+	 */
+	ctrlr->endpoint->interrupt_mode = interrupt_mode;
+	set_ctrlr_intr_mode(ctrlr);
 }
 
 static int
@@ -3755,7 +4638,7 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
 	struct nvmf_vfio_user_sq *sq = cb_arg;
-	struct nvmf_vfio_user_cq *cq;
+	struct nvmf_vfio_user_cq *admin_cq;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
 	struct nvmf_vfio_user_endpoint *endpoint;
 
@@ -3777,8 +4660,8 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 	vu_group = SPDK_CONTAINEROF(sq->group, struct nvmf_vfio_user_poll_group, group);
 	TAILQ_INSERT_TAIL(&vu_group->sqs, sq, link);
 
-	cq = vu_ctrlr->cqs[0];
-	assert(cq != NULL);
+	admin_cq = vu_ctrlr->cqs[0];
+	assert(admin_cq != NULL);
 
 	pthread_mutex_lock(&endpoint->lock);
 	if (nvmf_qpair_is_admin_queue(&sq->qpair)) {
@@ -3786,24 +4669,27 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 		vu_ctrlr->thread = spdk_get_thread();
 		vu_ctrlr->ctrlr = sq->qpair.ctrlr;
 		vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
-		vu_ctrlr->vfu_ctx_poller = SPDK_POLLER_REGISTER(vfio_user_poll_vfu_ctx, vu_ctrlr, 0);
 
-		cq->thread = spdk_get_thread();
+		admin_cq->thread = spdk_get_thread();
 
-		if (spdk_interrupt_mode_is_enabled() &&
-		    endpoint->transport->intr_mode_supported) {
+		if (in_interrupt_mode(endpoint->transport)) {
+			vu_ctrlr->vfu_ctx_poller = SPDK_POLLER_REGISTER(vfio_user_poll_vfu_ctx,
+						   vu_ctrlr, 0);
+
 			vu_ctrlr->intr_fd = vfu_get_poll_fd(vu_ctrlr->endpoint->vfu_ctx);
 			assert(vu_ctrlr->intr_fd != -1);
 
 			vu_ctrlr->intr = SPDK_INTERRUPT_REGISTER(vu_ctrlr->intr_fd,
-					 vfio_user_handle_intr,
-					 vu_ctrlr);
+					 vfio_user_ctrlr_intr, vu_ctrlr);
 
 			assert(vu_ctrlr->intr != NULL);
 
 			spdk_poller_register_interrupt(vu_ctrlr->vfu_ctx_poller,
-						       set_intr_mode_noop,
+						       vfio_user_set_intr_mode,
 						       vu_ctrlr);
+		} else {
+			vu_ctrlr->vfu_ctx_poller = SPDK_POLLER_REGISTER(vfio_user_poll_vfu_ctx,
+						   vu_ctrlr, 1000);
 		}
 	} else {
 		/* For I/O queues this command was generated in response to an
@@ -3811,8 +4697,8 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 		 * been completed. Complete it now.
 		 */
 		if (sq->post_create_io_sq_completion) {
-			assert(cq->thread != NULL);
-			if (cq->thread != spdk_get_thread()) {
+			assert(admin_cq->thread != NULL);
+			if (admin_cq->thread != spdk_get_thread()) {
 				struct vfio_user_post_cpl_ctx *cpl_ctx;
 
 				cpl_ctx = calloc(1, sizeof(*cpl_ctx));
@@ -3820,19 +4706,28 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 					return -ENOMEM;
 				}
 				cpl_ctx->ctrlr = vu_ctrlr;
-				cpl_ctx->cq = cq;
+				cpl_ctx->cq = admin_cq;
 				cpl_ctx->cpl.sqid = 0;
 				cpl_ctx->cpl.cdw0 = 0;
 				cpl_ctx->cpl.cid = sq->create_io_sq_cmd.cid;
 				cpl_ctx->cpl.status.sc = SPDK_NVME_SC_SUCCESS;
 				cpl_ctx->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 
-				spdk_thread_send_msg(cq->thread, _post_completion_msg, cpl_ctx);
+				spdk_thread_send_msg(admin_cq->thread, _post_completion_msg,
+						     cpl_ctx);
 			} else {
-				post_completion(vu_ctrlr, cq, 0, 0,
+				post_completion(vu_ctrlr, admin_cq, 0, 0,
 						sq->create_io_sq_cmd.cid, SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
 			}
 			sq->post_create_io_sq_completion = false;
+		} else if (in_interrupt_mode(endpoint->transport)) {
+			/*
+			 * FIXME self_kick() ends up polling all queues on the
+			 * controller thread, and this will be wrong if we ever
+			 * support interrupt mode with I/O queues in a
+			 * different poll group than the controller's.
+			 */
+			self_kick(vu_ctrlr);
 		}
 		sq->sq_state = VFIO_USER_SQ_ACTIVE;
 	}
@@ -3902,7 +4797,7 @@ nvmf_vfio_user_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	vu_req->cb_arg = sq;
 
 	SPDK_DEBUGLOG(nvmf_vfio,
-		      "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
+		      "%s: sending connect fabrics command for qid:%#x cntlid=%#x\n",
 		      ctrlr_id(ctrlr), qpair->qid, data->cntlid);
 
 	spdk_nvmf_request_exec_fabrics(req);
@@ -3996,6 +4891,14 @@ nvmf_vfio_user_close_qpair(struct spdk_nvmf_qpair *qpair,
 	delete_sq_done(vu_ctrlr, sq);
 	if (TAILQ_EMPTY(&vu_ctrlr->connected_sqs)) {
 		endpoint->ctrlr = NULL;
+		if (vu_ctrlr->in_source_vm && endpoint->need_resume) {
+			/* The controller will be freed, we can resume the subsystem
+			 * now so that the endpoint can be ready to accept another
+			 * new connection.
+			 */
+			spdk_nvmf_subsystem_resume((struct spdk_nvmf_subsystem *)endpoint->subsystem,
+						   vfio_user_endpoint_resume_done, endpoint);
+		}
 		free_ctrlr(vu_ctrlr);
 	}
 	pthread_mutex_unlock(&endpoint->lock);
@@ -4185,7 +5088,7 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	req = &vu_req->req;
 
 	assert(req->qpair != NULL);
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: handle qid%u, req opc=%#x cid=%d\n",
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: handle sqid:%u, req opc=%#x cid=%d\n",
 		      ctrlr_id(ctrlr), req->qpair->qid, cmd->opc, cmd->cid);
 
 	vu_req->cb_fn = handle_cmd_rsp;
@@ -4224,6 +5127,46 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	return 0;
 }
 
+/*
+ * If we suppressed an IRQ in post_completion(), check if it needs to be fired
+ * here: if the host isn't up to date, and is apparently not actively processing
+ * the queue (i.e. ->last_head isn't changing), we need an IRQ.
+ */
+static void
+handle_suppressed_irq(struct nvmf_vfio_user_ctrlr *ctrlr,
+		      struct nvmf_vfio_user_sq *sq)
+{
+	struct nvmf_vfio_user_cq *cq = ctrlr->cqs[sq->cqid];
+	uint32_t cq_head;
+	uint32_t cq_tail;
+
+	if (!cq->ien || cq->qid == 0 || !ctrlr_interrupt_enabled(ctrlr)) {
+		return;
+	}
+
+	cq_tail = *cq_tailp(cq);
+
+	/* Already sent? */
+	if (cq_tail == cq->last_trigger_irq_tail) {
+		return;
+	}
+
+	spdk_ivdt_dcache(cq_dbl_headp(cq));
+	cq_head = *cq_dbl_headp(cq);
+
+	if (cq_head != cq_tail && cq_head == cq->last_head) {
+		int err = vfu_irq_trigger(ctrlr->endpoint->vfu_ctx, cq->iv);
+		if (err != 0) {
+			SPDK_ERRLOG("%s: failed to trigger interrupt: %m\n",
+				    ctrlr_id(ctrlr));
+		} else {
+			cq->last_trigger_irq_tail = cq_tail;
+		}
+	}
+
+	cq->last_head = cq_head;
+}
+
 /* Returns the number of commands processed, or a negative value on error. */
 static int
 nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq)
@@ -4236,6 +5179,10 @@ nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq)
 
 	ctrlr = sq->ctrlr;
 
+	if (ctrlr->adaptive_irqs_enabled) {
+		handle_suppressed_irq(ctrlr, sq);
+	}
+
 	/* On aarch64 platforms, doorbells update from guest VM may not be seen
 	 * on SPDK target side. This is because there is memory type mismatch
 	 * situation here. That is on guest VM side, the doorbells are treated as
@@ -4246,10 +5193,38 @@ nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq)
 	 * cannot fix this. Use "dc civac" to invalidate cache may solve
 	 * this.
 	 */
-	spdk_ivdt_dcache(sq_dbl_tailp(ctrlr, sq));
+	spdk_ivdt_dcache(sq_dbl_tailp(sq));
 
 	/* Load-Acquire. */
-	new_tail = *sq_dbl_tailp(ctrlr, sq);
+	new_tail = *sq_dbl_tailp(sq);
+
+	new_tail = new_tail & 0xffffu;
+	if (spdk_unlikely(new_tail >= sq->size)) {
+		union spdk_nvme_async_event_completion event = {};
+
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: invalid sqid:%u doorbell value %u\n", ctrlr_id(ctrlr), sq->qid,
+			      new_tail);
+		event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_ERROR;
+		event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE;
+		nvmf_ctrlr_async_event_error_event(ctrlr->ctrlr, event);
+
+		return -1;
+	}
+
+	if (*sq_headp(sq) == new_tail) {
+		return 0;
+	}
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: sqid:%u doorbell old=%u new=%u\n",
+		      ctrlr_id(ctrlr), sq->qid, *sq_headp(sq), new_tail);
+	if (ctrlr->sdbl != NULL) {
+		SPDK_DEBUGLOG(nvmf_vfio,
+			      "%s: sqid:%u bar0_doorbell=%u shadow_doorbell=%u eventidx=%u\n",
+			      ctrlr_id(ctrlr), sq->qid,
+			      ctrlr->bar0_doorbells[queue_index(sq->qid, false)],
+			      ctrlr->sdbl->shadow_doorbells[queue_index(sq->qid, false)],
+			      ctrlr->sdbl->eventidxs[queue_index(sq->qid, false)]);
+	}
 
 	/*
 	 * Ensure that changes to the queue are visible to us.
@@ -4257,23 +5232,6 @@ nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq)
 	 * update the SQ tail doorbell (their Store-Release).
 	 */
 	spdk_rmb();
-
-	new_tail = new_tail & 0xffffu;
-	if (spdk_unlikely(new_tail >= sq->size)) {
-		union spdk_nvme_async_event_completion event = {};
-
-		SPDK_DEBUGLOG(nvmf_vfio, "%s: invalid SQ%u doorbell value %u\n", ctrlr_id(ctrlr), sq->qid,
-			      new_tail);
-		event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_ERROR;
-		event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE;
-		nvmf_ctrlr_async_event_error_event(ctrlr->ctrlr, event);
-
-		return 0;
-	}
-
-	if (*sq_headp(sq) == new_tail) {
-		return 0;
-	}
 
 	count = handle_sq_tdbl_write(ctrlr, new_tail, sq);
 	if (count < 0) {
@@ -4286,7 +5244,7 @@ nvmf_vfio_user_sq_poll(struct nvmf_vfio_user_sq *sq)
 /*
  * vfio-user transport poll handler. Note that the library context is polled in
  * a separate poller (->vfu_ctx_poller), so this poller only needs to poll the
- * active qpairs.
+ * active SQs.
  *
  * Returns the number of commands processed, or a negative value on error.
  */
@@ -4299,9 +5257,9 @@ nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	assert(group != NULL);
 
-	spdk_rmb();
-
 	vu_group = SPDK_CONTAINEROF(group, struct nvmf_vfio_user_poll_group, group);
+
+	SPDK_DEBUGLOG(vfio_user_db, "polling all SQs\n");
 
 	TAILQ_FOREACH_SAFE(sq, &vu_group->sqs, link, tmp) {
 		int ret;
@@ -4435,3 +5393,4 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_vfio_user = {
 
 SPDK_NVMF_TRANSPORT_REGISTER(muser, &spdk_nvmf_transport_vfio_user);
 SPDK_LOG_REGISTER_COMPONENT(nvmf_vfio)
+SPDK_LOG_REGISTER_COMPONENT(vfio_user_db)

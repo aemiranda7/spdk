@@ -3,7 +3,7 @@
 function discover_bdevs() {
 	local rootdir=$1
 	local config_file=$2
-	local wait_for_spdk_bdev=30
+	local wait_for_spdk_bdev=90
 	local rpc_server=/var/tmp/spdk-discover-bdevs.sock
 
 	if [ ! -e $config_file ]; then
@@ -136,7 +136,7 @@ function get_numa_node() {
 		bdevs=$(discover_bdevs $rootdir $testdir/bdev.conf)
 		for name in $disks; do
 			local bdev_bdf
-			bdev_bdf=$(jq -r ".[] | select(.name==\"$name\").driver_specific.nvme.pci_address" <<< $bdevs)
+			bdev_bdf=$(jq -r ".[] | select(.name==\"$name\").driver_specific.nvme[].pci_address" <<< "$bdevs")
 			cat /sys/bus/pci/devices/$bdev_bdf/numa_node
 		done
 	else
@@ -440,7 +440,7 @@ function run_bdevperf() {
 		sleep 3
 	fi
 
-	PYTHONPATH=$PYTHONPATH:$rootdir/scripts $bdevperf_rpc -s "$rpc_socket" -t $((RUNTIME + 10)) perform_tests
+	PYTHONPATH=$PYTHONPATH:$rootdir/python $bdevperf_rpc -s "$rpc_socket" -t $((RUNTIME + 10)) perform_tests
 
 	# Using "-z" option causes bdevperf to NOT exit automatically after running the test,
 	# so we need to stop it ourselves.

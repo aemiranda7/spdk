@@ -115,7 +115,7 @@ endif
 
 ACCEL_MODULES_LIST = accel_ioat ioat
 ifeq ($(CONFIG_IDXD),y)
-ACCEL_MODULES_LIST += accel_idxd idxd
+ACCEL_MODULES_LIST += accel_dsa accel_iaa idxd
 endif
 
 SCHEDULER_MODULES_LIST = scheduler_dynamic

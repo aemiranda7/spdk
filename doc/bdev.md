@@ -120,7 +120,7 @@ a value of 1 tells the driver to use QAT and if not available then the creation 
 the vbdev should fail to create or load.  A value of '2' as shown below tells the module
 to use ISAL and if for some reason it is not available, the vbdev should fail to create or load.
 
-`rpc.py compress_set_pmd -p 2`
+`rpc.py bdev_compress_set_pmd -p 2`
 
 To remove a compression vbdev, use the following command which will also delete the PMEM
 file.  If the logical volume is deleted the PMEM file will not be removed and the
@@ -139,14 +139,17 @@ all volumes, if used it will return the name or an error that the device does no
 The crypto virtual bdev module can be configured to provide at rest data encryption
 for any underlying bdev. The module relies on the DPDK CryptoDev Framework to provide
 all cryptographic functionality. The framework provides support for many different software
-only cryptographic modules as well hardware assisted support for the Intel QAT board. The
-framework also provides support for cipher, hash, authentication and AEAD functions. At this
-time the SPDK virtual bdev module supports cipher only as follows:
+only cryptographic modules as well hardware assisted support for the Intel QAT board and
+NVIDIA crypto enabled NICs.
+The framework also provides support for cipher, hash, authentication and AEAD functions.
+At this time the SPDK virtual bdev module supports cipher only as follows:
 
 - AESN-NI Multi Buffer Crypto Poll Mode Driver: RTE_CRYPTO_CIPHER_AES128_CBC
-- Intel(R) QuickAssist (QAT) Crypto Poll Mode Driver: RTE_CRYPTO_CIPHER_AES128_CBC
+- Intel(R) QuickAssist (QAT) Crypto Poll Mode Driver: RTE_CRYPTO_CIPHER_AES128_CBC,
+  RTE_CRYPTO_CIPHER_AES128_XTS
   (Note: QAT is functional however is marked as experimental until the hardware has
   been fully integrated with the SPDK CI system.)
+- MLX5 Crypto Poll Mode Driver: RTE_CRYPTO_CIPHER_AES256_XTS, RTE_CRYPTO_CIPHER_AES512_XTS
 
 In order to support using the bdev block offset (LBA) as the initialization vector (IV),
 the crypto module break up all I/O into crypto operations of a size equal to the block
@@ -161,15 +164,35 @@ may cause problems in some use cases.
 
 Example command
 
-`rpc.py bdev_crypto_create NVMe1n1 CryNvmeA crypto_aesni_mb 0123456789123456`
+`rpc.py bdev_crypto_create NVMe1n1 CryNvmeA crypto_aesni_mb 01234567891234560123456789123456`
 
 This command will create a crypto vbdev called 'CryNvmeA' on top of the NVMe bdev
 'NVMe1n1' and will use the DPDK software driver 'crypto_aesni_mb' and the key
-'0123456789123456'.
+'01234567891234560123456789123456'.
+
+Please make sure the keys are provided in hexlified format. This means string passed to
+rpc.py must be twice as long than the key length in binary form.
+
+Example command
+
+rpc.py bdev_crypto_create -c AES_XTS -k2 7859243a027411e581e0c40a35c8228f NVMe1n1 CryNvmeA \
+mlx5_pci d16a2f3a9e9f5b32daefacd7f5984f4578add84425be4a0baa489b9de8884b09
+
+This command will create a crypto vbdev called 'CryNvmeA' on top of the NVMe bdev
+'NVMe1n1' and will use the DPDK software driver 'mlx5_pci', the AES key
+'d16a2f3a9e9f5b32daefacd7f5984f4578add84425be4a0baa489b9de8884b09' and the XTS key
+'7859243a027411e581e0c40a35c8228f'. In other words, the compound AES_XTS key to be used is
+'d16a2f3a9e9f5b32daefacd7f5984f4578add84425be4a0baa489b9de8884b097859243a027411e581e0c40a35c8228f'
 
 To remove the vbdev use the bdev_crypto_delete command.
 
 `rpc.py bdev_crypto_delete CryNvmeA`
+
+The MLX5 driver works with crypto enabled Nvidia NICs and requires special configuration of
+DPDK environment to enable crypto function. It can be done via SPDK event library by configuring
+`env_context` member of `spdk_app_opts` structure or by passing corresponding CLI arguments in
+the following form: `--allow=BDF,class=crypto,wcs_file=/full/path/to/wrapped/credentials`, e.g.
+`--allow=0000:01:00.0,class=crypto,wcs_file=/path/credentials.txt`.
 
 ## Delay Bdev Module {#bdev_config_delay}
 
@@ -372,6 +395,9 @@ To remove an NVMe controller use the bdev_nvme_detach_controller command.
 `rpc.py bdev_nvme_detach_controller Nvme0`
 
 This command will remove NVMe bdev named Nvme0.
+
+The SPDK NVMe bdev driver provides the multipath feature. Please refer to
+@ref nvme_multipath for details.
 
 ### NVMe bdev character device {#bdev_config_nvme_cuse}
 

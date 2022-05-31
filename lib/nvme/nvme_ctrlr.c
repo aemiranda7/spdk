@@ -619,13 +619,6 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 		return 0;
 	}
 
-	if (qpair->poll_group && qpair->poll_group->in_completion_context) {
-		/* Same as above, but in a poll group. */
-		qpair->poll_group->num_qpairs_to_delete++;
-		qpair->delete_after_completion_context = 1;
-		return 0;
-	}
-
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 
 	if (qpair->poll_group) {
@@ -1047,6 +1040,11 @@ nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
 		return;
 	}
 
+	if (ctrlr->is_disconnecting) {
+		NVME_CTRLR_DEBUGLOG(ctrlr, "already disconnecting\n");
+		return;
+	}
+
 	ctrlr->is_failed = true;
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
 	NVME_CTRLR_ERRLOG(ctrlr, "in failed state.\n");
@@ -1369,6 +1367,8 @@ nvme_ctrlr_state_string(enum nvme_ctrlr_state state)
 		return "disable and wait for CSTS.RDY = 0";
 	case NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0_WAIT_FOR_CSTS:
 		return "disable and wait for CSTS.RDY = 0 reg";
+	case NVME_CTRLR_STATE_DISABLED:
+		return "controller is disabled";
 	case NVME_CTRLR_STATE_ENABLE:
 		return "enable controller by writing CC.EN = 1";
 	case NVME_CTRLR_STATE_ENABLE_WAIT_FOR_CC:
@@ -1629,26 +1629,22 @@ nvme_ctrlr_abort_queued_aborts(struct spdk_nvme_ctrlr *ctrlr)
 	}
 }
 
-int
-spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
+static int
+nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct spdk_nvme_qpair	*qpair;
-
-	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
-	ctrlr->prepare_for_reset = false;
-
 	if (ctrlr->is_resetting || ctrlr->is_removed) {
 		/*
 		 * Controller is already resetting or has been removed. Return
 		 *  immediately since there is no need to kick off another
 		 *  reset in these cases.
 		 */
-		nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
 		return ctrlr->is_resetting ? -EBUSY : -ENXIO;
 	}
 
 	ctrlr->is_resetting = true;
 	ctrlr->is_failed = false;
+	ctrlr->is_disconnecting = true;
+	ctrlr->prepare_for_reset = true;
 
 	NVME_CTRLR_NOTICELOG(ctrlr, "resetting controller\n");
 
@@ -1660,13 +1656,17 @@ spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 
 	nvme_transport_admin_qpair_abort_aers(ctrlr->adminq);
 
-	/* Disable all queues before disabling the controller hardware. */
-	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
-		qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
-	}
-
 	ctrlr->adminq->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
+
+	return 0;
+}
+
+static void
+nvme_ctrlr_disconnect_done(struct spdk_nvme_ctrlr *ctrlr)
+{
+	assert(ctrlr->is_failed == false);
+	ctrlr->is_disconnecting = false;
 
 	/* Doorbell buffer config is invalid during reset */
 	nvme_ctrlr_free_doorbell_buffer(ctrlr);
@@ -1675,9 +1675,18 @@ spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_ctrlr_free_iocs_specific_data(ctrlr);
 
 	spdk_bit_array_free(&ctrlr->free_io_qids);
+}
 
+int
+spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
+{
+	int rc;
+
+	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
+	rc = nvme_ctrlr_disconnect(ctrlr);
 	nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
-	return 0;
+
+	return rc;
 }
 
 void
@@ -1685,26 +1694,14 @@ spdk_nvme_ctrlr_reconnect_async(struct spdk_nvme_ctrlr *ctrlr)
 {
 	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
 
+	ctrlr->prepare_for_reset = false;
+
 	/* Set the state back to INIT to cause a full hardware reset. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_INIT, NVME_TIMEOUT_INFINITE);
 
 	/* Return without releasing ctrlr_lock. ctrlr_lock will be released when
 	 * spdk_nvme_ctrlr_reset_poll_async() returns 0.
 	 */
-}
-
-static int
-nvme_ctrlr_reset_pre(struct spdk_nvme_ctrlr *ctrlr)
-{
-	int rc;
-
-	rc = spdk_nvme_ctrlr_disconnect(ctrlr);
-	if (rc != 0) {
-		return rc;
-	}
-
-	spdk_nvme_ctrlr_reconnect_async(ctrlr);
-	return 0;
 }
 
 /**
@@ -1785,77 +1782,79 @@ spdk_nvme_ctrlr_reconnect_poll_async(struct spdk_nvme_ctrlr *ctrlr)
 	return rc;
 }
 
+/*
+ * For PCIe transport, spdk_nvme_ctrlr_disconnect() will do a Controller Level Reset
+ * (Change CC.EN from 1 to 0) as a operation to disconnect the admin qpair.
+ * The following two functions are added to do a Controller Level Reset. They have
+ * to be called under the nvme controller's lock.
+ */
+void
+nvme_ctrlr_disable(struct spdk_nvme_ctrlr *ctrlr)
+{
+	assert(ctrlr->is_disconnecting == true);
+
+	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_CHECK_EN, NVME_TIMEOUT_INFINITE);
+}
+
+int
+nvme_ctrlr_disable_poll(struct spdk_nvme_ctrlr *ctrlr)
+{
+	int rc = 0;
+
+	if (nvme_ctrlr_process_init(ctrlr) != 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "failed to disable controller\n");
+		rc = -1;
+	}
+
+	if (ctrlr->state != NVME_CTRLR_STATE_DISABLED && rc != -1) {
+		return -EAGAIN;
+	}
+
+	return rc;
+}
+
 static void
-nvme_ctrlr_reset_ctx_init(struct spdk_nvme_ctrlr_reset_ctx *ctrlr_reset_ctx,
-			  struct spdk_nvme_ctrlr *ctrlr)
+nvme_ctrlr_fail_io_qpairs(struct spdk_nvme_ctrlr *ctrlr)
 {
-	ctrlr_reset_ctx->ctrlr = ctrlr;
-}
+	struct spdk_nvme_qpair	*qpair;
 
-static int
-nvme_ctrlr_reset_poll_async(struct spdk_nvme_ctrlr_reset_ctx *ctrlr_reset_ctx)
-{
-	struct spdk_nvme_ctrlr *ctrlr = ctrlr_reset_ctx->ctrlr;
-
-	return spdk_nvme_ctrlr_reconnect_poll_async(ctrlr);
-}
-
-int
-spdk_nvme_ctrlr_reset_poll_async(struct spdk_nvme_ctrlr_reset_ctx *ctrlr_reset_ctx)
-{
-	int rc;
-	if (!ctrlr_reset_ctx) {
-		return -EINVAL;
+	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
+		qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 	}
-	rc = nvme_ctrlr_reset_poll_async(ctrlr_reset_ctx);
-	if (rc == -EAGAIN) {
-		return rc;
-	}
-
-	free(ctrlr_reset_ctx);
-	return rc;
-}
-
-int
-spdk_nvme_ctrlr_reset_async(struct spdk_nvme_ctrlr *ctrlr,
-			    struct spdk_nvme_ctrlr_reset_ctx **reset_ctx)
-{
-	struct spdk_nvme_ctrlr_reset_ctx *ctrlr_reset_ctx;
-	int rc;
-
-	ctrlr_reset_ctx = calloc(1, sizeof(*ctrlr_reset_ctx));
-	if (!ctrlr_reset_ctx) {
-		return -ENOMEM;
-	}
-
-	rc = nvme_ctrlr_reset_pre(ctrlr);
-	if (rc != 0) {
-		free(ctrlr_reset_ctx);
-	} else {
-		nvme_ctrlr_reset_ctx_init(ctrlr_reset_ctx, ctrlr);
-		*reset_ctx = ctrlr_reset_ctx;
-	}
-
-	return rc;
 }
 
 int
 spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct spdk_nvme_ctrlr_reset_ctx reset_ctx = {};
 	int rc;
 
-	rc = nvme_ctrlr_reset_pre(ctrlr);
+	nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
+
+	rc = nvme_ctrlr_disconnect(ctrlr);
+	if (rc == 0) {
+		nvme_ctrlr_fail_io_qpairs(ctrlr);
+	}
+
+	nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
+
 	if (rc != 0) {
 		if (rc == -EBUSY) {
 			rc = 0;
 		}
 		return rc;
 	}
-	nvme_ctrlr_reset_ctx_init(&reset_ctx, ctrlr);
+
+	while (1) {
+		rc = spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+		if (rc == -ENXIO) {
+			break;
+		}
+	}
+
+	spdk_nvme_ctrlr_reconnect_async(ctrlr);
 
 	while (true) {
-		rc = nvme_ctrlr_reset_poll_async(&reset_ctx);
+		rc = spdk_nvme_ctrlr_reconnect_poll_async(ctrlr);
 		if (rc != -EAGAIN) {
 			break;
 		}
@@ -1980,7 +1979,7 @@ nvme_ctrlr_identify_done(void *arg, const struct spdk_nvme_cpl *cpl)
 		}
 	}
 
-	if (ctrlr->cdata.sgls.supported) {
+	if (ctrlr->cdata.sgls.supported && !(ctrlr->quirks & NVME_QUIRK_NOT_USE_SGL)) {
 		assert(ctrlr->cdata.sgls.supported != 0x3);
 		ctrlr->flags |= SPDK_NVME_CTRLR_SGL_SUPPORTED;
 		if (ctrlr->cdata.sgls.supported == 0x2) {
@@ -3717,13 +3716,8 @@ nvme_ctrlr_process_init_wait_for_ready_0(void *ctx, uint64_t value, const struct
 	csts.raw = (uint32_t)value;
 	if (csts.bits.rdy == 0) {
 		NVME_CTRLR_DEBUGLOG(ctrlr, "CC.EN = 0 && CSTS.RDY = 0\n");
-		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ENABLE,
+		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_DISABLED,
 				     nvme_ctrlr_get_ready_timeout(ctrlr));
-		/*
-		 * Delay 100us before setting CC.EN = 1.  Some NVMe SSDs miss CC.EN getting
-		 *  set to 1 if it is too soon after CSTS.RDY is reported as 0.
-		 */
-		spdk_delay_us(100);
 	} else {
 		nvme_ctrlr_set_state_quiet(ctrlr, NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0,
 					   NVME_TIMEOUT_KEEP_EXISTING);
@@ -3843,6 +3837,11 @@ nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
 			 */
 			nvme_qpair_abort_queued_reqs(ctrlr->adminq, 0);
 			break;
+		case NVME_QPAIR_DISCONNECTING:
+			assert(ctrlr->adminq->async == true);
+			break;
+		case NVME_QPAIR_DISCONNECTED:
+		/* fallthrough */
 		default:
 			nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
 			break;
@@ -3890,10 +3889,27 @@ nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
 		rc = nvme_ctrlr_get_csts_async(ctrlr, nvme_ctrlr_process_init_wait_for_ready_0, ctrlr);
 		break;
 
+	case NVME_CTRLR_STATE_DISABLED:
+		if (ctrlr->is_disconnecting) {
+			NVME_CTRLR_DEBUGLOG(ctrlr, "Ctrlr was disabled.\n");
+		} else {
+			nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ENABLE, ready_timeout_in_ms);
+
+			/*
+			 * Delay 100us before setting CC.EN = 1.  Some NVMe SSDs miss CC.EN getting
+			 *  set to 1 if it is too soon after CSTS.RDY is reported as 0.
+			 */
+			spdk_delay_us(100);
+		}
+		break;
+
 	case NVME_CTRLR_STATE_ENABLE:
 		NVME_CTRLR_DEBUGLOG(ctrlr, "Setting CC.EN = 1\n");
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ENABLE_WAIT_FOR_CC, ready_timeout_in_ms);
 		rc = nvme_ctrlr_enable(ctrlr);
+		if (rc) {
+			NVME_CTRLR_ERRLOG(ctrlr, "Ctrlr enable failed with error: %d", rc);
+		}
 		return rc;
 
 	case NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1:
@@ -4000,12 +4016,23 @@ nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
 	case NVME_CTRLR_STATE_WAIT_FOR_SUPPORTED_INTEL_LOG_PAGES:
 	case NVME_CTRLR_STATE_WAIT_FOR_DB_BUF_CFG:
 	case NVME_CTRLR_STATE_WAIT_FOR_HOST_ID:
-		spdk_nvme_qpair_process_completions(ctrlr->adminq, 0);
+		/*
+		 * nvme_ctrlr_process_init() may be called from the completion context
+		 * for the admin qpair. Avoid recursive calls for this case.
+		 */
+		if (!ctrlr->adminq->in_completion_context) {
+			spdk_nvme_qpair_process_completions(ctrlr->adminq, 0);
+		}
 		break;
 
 	default:
 		assert(0);
 		return -1;
+	}
+
+	if (rc) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Ctrlr operation failed with error: %d, ctrlr state: %d",
+				  rc, ctrlr->state);
 	}
 
 	/* Note: we use the ticks captured when we entered this function.
@@ -4137,6 +4164,7 @@ nvme_ctrlr_destruct_async(struct spdk_nvme_ctrlr *ctrlr,
 
 	NVME_CTRLR_DEBUGLOG(ctrlr, "Prepare to destruct SSD\n");
 
+	ctrlr->prepare_for_reset = false;
 	ctrlr->is_destructed = true;
 
 	spdk_nvme_qpair_process_completions(ctrlr->adminq, 0);
@@ -4291,6 +4319,10 @@ spdk_nvme_ctrlr_process_admin_completions(struct spdk_nvme_ctrlr *ctrlr)
 	active_proc = nvme_ctrlr_get_current_process(ctrlr);
 	if (active_proc) {
 		nvme_ctrlr_complete_queued_async_events(ctrlr);
+	}
+
+	if (rc == -ENXIO && ctrlr->is_disconnecting) {
+		nvme_ctrlr_disconnect_done(ctrlr);
 	}
 
 	nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);

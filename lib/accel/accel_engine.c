@@ -60,8 +60,6 @@
 /* Largest context size for all accel modules */
 static size_t g_max_accel_module_size = 0;
 
-static struct spdk_accel_engine *g_hw_accel_engine = NULL;
-static struct spdk_accel_engine *g_sw_accel_engine = NULL;
 static struct spdk_accel_module_if *g_accel_engine_module = NULL;
 static spdk_accel_fini_cb g_fini_cb_fn = NULL;
 static void *g_fini_cb_arg = NULL;
@@ -70,46 +68,48 @@ static void *g_fini_cb_arg = NULL;
 static TAILQ_HEAD(, spdk_accel_module_if) spdk_accel_module_list =
 	TAILQ_HEAD_INITIALIZER(spdk_accel_module_list);
 
-static void _sw_accel_dualcast(void *dst1, void *dst2, void *src, size_t nbytes, int flags);
-static void _sw_accel_copy(void *dst, void *src, size_t nbytes, int flags);
-static void _sw_accel_copyv(void *dst, struct iovec *iov, uint32_t iovcnt, int flags);
-static int _sw_accel_compare(void *src1, void *src2, size_t nbytes);
-static void _sw_accel_fill(void *dst, uint8_t fill, size_t nbytes, int flags);
-static void _sw_accel_crc32c(uint32_t *dst, void *src, uint32_t seed, size_t nbytes);
-static void _sw_accel_crc32cv(uint32_t *dst, struct iovec *iov, uint32_t iovcnt, uint32_t seed);
+/* Global list of registered engines */
+static TAILQ_HEAD(, spdk_accel_engine) g_engine_list =
+	TAILQ_HEAD_INITIALIZER(g_engine_list);
 
-/* Registration of hw modules (currently supports only 1 at a time) */
-void
-spdk_accel_hw_engine_register(struct spdk_accel_engine *accel_engine)
+/* Global array mapping capabilities to engines */
+static struct spdk_accel_engine *g_engines_opc[ACCEL_OPC_LAST] = {};
+
+static int sw_accel_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *first_task);
+
+static struct spdk_accel_engine *
+_engine_find_by_name(const char *name)
 {
-	if (g_hw_accel_engine == NULL) {
-		g_hw_accel_engine = accel_engine;
-	} else {
-		SPDK_NOTICELOG("Hardware offload engine already enabled\n");
+	struct spdk_accel_engine *accel_engine = NULL;
+
+	TAILQ_FOREACH(accel_engine, &g_engine_list, tailq) {
+		if (strcmp(name, accel_engine->name) == 0) {
+			break;
+		}
 	}
+
+	return accel_engine;
 }
 
-/* Registration of sw modules (currently supports only 1) */
-static void
-accel_sw_register(struct spdk_accel_engine *accel_engine)
+/* Registration of all engines */
+void
+spdk_accel_engine_register(struct spdk_accel_engine *engine)
 {
-	assert(g_sw_accel_engine == NULL);
-	g_sw_accel_engine = accel_engine;
-}
+	if (_engine_find_by_name(engine->name)) {
+		SPDK_NOTICELOG("Accel engine %s already registered\n", engine->name);
+		assert(false);
+		return;
+	}
 
-static void
-accel_sw_unregister(void)
-{
-	g_sw_accel_engine = NULL;
-}
-
-/* Used to determine whether a command is sent to an engine/module or done here
- * via SW implementation.
- */
-inline static bool
-_is_supported(struct spdk_accel_engine *engine, enum accel_capability operation)
-{
-	return ((engine->capabilities & operation) == operation);
+	/* Make sure that the software engine is at the head of the list, this
+	 * will assure that all opcodes are later assigned to software first and
+	 * then udpated to HW engines as they are registered.
+	 */
+	if (strcmp(engine->name, "software") == 0) {
+		TAILQ_INSERT_HEAD(&g_engine_list, engine, tailq);
+	} else {
+		TAILQ_INSERT_TAIL(&g_engine_list, engine, tailq);
+	}
 }
 
 void
@@ -126,15 +126,6 @@ spdk_accel_task_complete(struct spdk_accel_task *accel_task, int status)
 	TAILQ_INSERT_HEAD(&accel_ch->task_pool, accel_task, link);
 
 	cb_fn(cb_arg, status);
-}
-
-/* Accel framework public API for discovering current engine capabilities. */
-uint64_t
-spdk_accel_get_capabilities(struct spdk_io_channel *ch)
-{
-	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
-
-	return accel_ch->engine->capabilities;
 }
 
 inline static struct spdk_accel_task *
@@ -161,10 +152,8 @@ _get_task(struct accel_io_channel *accel_ch, spdk_accel_completion_cb cb_fn, voi
 /* Post SW completions to a list and complete in a poller as we don't want to
  * complete them on the caller's stack as they'll likely submit another. */
 inline static void
-_add_to_comp_list(struct accel_io_channel *accel_ch, struct spdk_accel_task *accel_task, int status)
+_add_to_comp_list(struct sw_accel_io_channel *sw_ch, struct spdk_accel_task *accel_task, int status)
 {
-	struct sw_accel_io_channel *sw_ch = spdk_io_channel_get_ctx(accel_ch->sw_engine_ch);
-
 	accel_task->status = status;
 	TAILQ_INSERT_TAIL(&sw_ch->tasks_to_complete, accel_task, link);
 }
@@ -185,12 +174,13 @@ _check_flags(int flags)
 
 /* Accel framework public API for copy function */
 int
-spdk_accel_submit_copy(struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes,
-		       int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_copy(struct spdk_io_channel *ch, void *dst, void *src,
+		       uint64_t nbytes, int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_COPY];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_COPY];
 
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
@@ -199,31 +189,23 @@ spdk_accel_submit_copy(struct spdk_io_channel *ch, void *dst, void *src, uint64_
 
 	accel_task->dst = dst;
 	accel_task->src = src;
-	accel_task->op_code = ACCEL_OPCODE_MEMMOVE;
+	accel_task->op_code = ACCEL_OPC_COPY;
 	accel_task->nbytes = nbytes;
 	accel_task->flags = flags;
 
-	if (_is_supported(accel_ch->engine, ACCEL_COPY)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _check_flags(flags);
-		if (rc) {
-			return rc;
-		}
-		_sw_accel_copy(dst, src, (size_t)nbytes, flags);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for dual cast copy function */
 int
-spdk_accel_submit_dualcast(struct spdk_io_channel *ch, void *dst1, void *dst2, void *src,
-			   uint64_t nbytes, int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_dualcast(struct spdk_io_channel *ch, void *dst1,
+			   void *dst2, void *src, uint64_t nbytes, int flags,
+			   spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_DUALCAST];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_DUALCAST];
 
 	if ((uintptr_t)dst1 & (ALIGN_4K - 1) || (uintptr_t)dst2 & (ALIGN_4K - 1)) {
 		SPDK_ERRLOG("Dualcast requires 4K alignment on dst addresses\n");
@@ -240,29 +222,21 @@ spdk_accel_submit_dualcast(struct spdk_io_channel *ch, void *dst1, void *dst2, v
 	accel_task->dst2 = dst2;
 	accel_task->nbytes = nbytes;
 	accel_task->flags = flags;
-	accel_task->op_code = ACCEL_OPCODE_DUALCAST;
+	accel_task->op_code = ACCEL_OPC_DUALCAST;
 
-	if (_is_supported(accel_ch->engine, ACCEL_DUALCAST)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _check_flags(flags);
-		if (rc) {
-			return rc;
-		}
-		_sw_accel_dualcast(dst1, dst2, src, (size_t)nbytes, flags);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for compare function */
 int
-spdk_accel_submit_compare(struct spdk_io_channel *ch, void *src1, void *src2, uint64_t nbytes,
-			  spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_compare(struct spdk_io_channel *ch, void *src1,
+			  void *src2, uint64_t nbytes, spdk_accel_completion_cb cb_fn,
+			  void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_COMPARE];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_COMPARE];
 
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
@@ -272,25 +246,21 @@ spdk_accel_submit_compare(struct spdk_io_channel *ch, void *src1, void *src2, ui
 	accel_task->src = src1;
 	accel_task->src2 = src2;
 	accel_task->nbytes = nbytes;
-	accel_task->op_code = ACCEL_OPCODE_COMPARE;
+	accel_task->op_code = ACCEL_OPC_COMPARE;
 
-	if (_is_supported(accel_ch->engine, ACCEL_COMPARE)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _sw_accel_compare(src1, src2, (size_t)nbytes);
-		_add_to_comp_list(accel_ch, accel_task, rc);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for fill function */
 int
-spdk_accel_submit_fill(struct spdk_io_channel *ch, void *dst, uint8_t fill, uint64_t nbytes,
-		       int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_fill(struct spdk_io_channel *ch, void *dst,
+		       uint8_t fill, uint64_t nbytes, int flags,
+		       spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_FILL];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_FILL];
 
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
@@ -298,31 +268,24 @@ spdk_accel_submit_fill(struct spdk_io_channel *ch, void *dst, uint8_t fill, uint
 	}
 
 	accel_task->dst = dst;
-	accel_task->fill_pattern = fill;
+	memset(&accel_task->fill_pattern, fill, sizeof(uint64_t));
 	accel_task->nbytes = nbytes;
 	accel_task->flags = flags;
-	accel_task->op_code = ACCEL_OPCODE_MEMFILL;
+	accel_task->op_code = ACCEL_OPC_FILL;
 
-	if (_is_supported(accel_ch->engine, ACCEL_FILL)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _check_flags(flags);
-		if (rc) {
-			return rc;
-		}
-		_sw_accel_fill(dst, fill, (size_t)nbytes, flags);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for CRC-32C function */
 int
-spdk_accel_submit_crc32c(struct spdk_io_channel *ch, uint32_t *crc_dst, void *src, uint32_t seed,
-			 uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_crc32c(struct spdk_io_channel *ch, uint32_t *crc_dst,
+			 void *src, uint32_t seed, uint64_t nbytes, spdk_accel_completion_cb cb_fn,
+			 void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_CRC32C];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_CRC32C];
 
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
@@ -334,24 +297,21 @@ spdk_accel_submit_crc32c(struct spdk_io_channel *ch, uint32_t *crc_dst, void *sr
 	accel_task->v.iovcnt = 0;
 	accel_task->seed = seed;
 	accel_task->nbytes = nbytes;
-	accel_task->op_code = ACCEL_OPCODE_CRC32C;
+	accel_task->op_code = ACCEL_OPC_CRC32C;
 
-	if (_is_supported(accel_ch->engine, ACCEL_CRC32C)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		_sw_accel_crc32c(crc_dst, src, seed, (size_t)nbytes);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for chained CRC-32C function */
 int
-spdk_accel_submit_crc32cv(struct spdk_io_channel *ch, uint32_t *crc_dst, struct iovec *iov,
-			  uint32_t iov_cnt, uint32_t seed, spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_crc32cv(struct spdk_io_channel *ch, uint32_t *crc_dst,
+			  struct iovec *iov, uint32_t iov_cnt, uint32_t seed,
+			  spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
-	struct accel_io_channel *accel_ch;
+	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_CRC32C];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_CRC32C];
 
 	if (iov == NULL) {
 		SPDK_ERRLOG("iov should not be NULL");
@@ -363,7 +323,6 @@ spdk_accel_submit_crc32cv(struct spdk_io_channel *ch, uint32_t *crc_dst, struct 
 		return -EINVAL;
 	}
 
-	accel_ch = spdk_io_channel_get_ctx(ch);
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
 		SPDK_ERRLOG("no memory\n");
@@ -375,26 +334,21 @@ spdk_accel_submit_crc32cv(struct spdk_io_channel *ch, uint32_t *crc_dst, struct 
 	accel_task->v.iovcnt = iov_cnt;
 	accel_task->crc_dst = crc_dst;
 	accel_task->seed = seed;
-	accel_task->op_code = ACCEL_OPCODE_CRC32C;
+	accel_task->op_code = ACCEL_OPC_CRC32C;
 
-	if (_is_supported(accel_ch->engine, ACCEL_CRC32C)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		_sw_accel_crc32cv(crc_dst, iov, iov_cnt, seed);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for copy with CRC-32C function */
 int
-spdk_accel_submit_copy_crc32c(struct spdk_io_channel *ch, void *dst, void *src,
-			      uint32_t *crc_dst, uint32_t seed, uint64_t nbytes, int flags,
-			      spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_copy_crc32c(struct spdk_io_channel *ch, void *dst,
+			      void *src, uint32_t *crc_dst, uint32_t seed, uint64_t nbytes,
+			      int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_COPY_CRC32C];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_COPY_CRC32C];
 
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
@@ -408,31 +362,23 @@ spdk_accel_submit_copy_crc32c(struct spdk_io_channel *ch, void *dst, void *src,
 	accel_task->seed = seed;
 	accel_task->nbytes = nbytes;
 	accel_task->flags = flags;
-	accel_task->op_code = ACCEL_OPCODE_COPY_CRC32C;
+	accel_task->op_code = ACCEL_OPC_COPY_CRC32C;
 
-	if (_is_supported(accel_ch->engine, ACCEL_COPY_CRC32C)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _check_flags(flags);
-		if (rc) {
-			return rc;
-		}
-		_sw_accel_copy(dst, src, (size_t)nbytes, flags);
-		_sw_accel_crc32c(crc_dst, src, seed, (size_t)nbytes);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
-	}
+	return engine->submit_tasks(engine_ch, accel_task);
 }
 
 /* Accel framework public API for chained copy + CRC-32C function */
 int
-spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst, struct iovec *src_iovs,
-			       uint32_t iov_cnt, uint32_t *crc_dst, uint32_t seed, int flags,
-			       spdk_accel_completion_cb cb_fn, void *cb_arg)
+spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst,
+			       struct iovec *src_iovs, uint32_t iov_cnt, uint32_t *crc_dst,
+			       uint32_t seed, int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
-	struct accel_io_channel *accel_ch;
+	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
 	struct spdk_accel_task *accel_task;
-	int rc;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_COPY_CRC32C];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_COPY_CRC32C];
+	uint64_t nbytes;
+	uint32_t i;
 
 	if (src_iovs == NULL) {
 		SPDK_ERRLOG("iov should not be NULL");
@@ -444,7 +390,6 @@ spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst, struct iov
 		return -EINVAL;
 	}
 
-	accel_ch = spdk_io_channel_get_ctx(ch);
 	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
 	if (accel_task == NULL) {
 		SPDK_ERRLOG("no memory\n");
@@ -452,26 +397,75 @@ spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst, struct iov
 		return -ENOMEM;
 	}
 
+	nbytes = 0;
+	for (i = 0; i < iov_cnt; i++) {
+		nbytes += src_iovs[i].iov_len;
+	}
+
 	accel_task->v.iovs = src_iovs;
 	accel_task->v.iovcnt = iov_cnt;
 	accel_task->dst = (void *)dst;
 	accel_task->crc_dst = crc_dst;
 	accel_task->seed = seed;
+	accel_task->nbytes = nbytes;
 	accel_task->flags = flags;
-	accel_task->op_code = ACCEL_OPCODE_COPY_CRC32C;
+	accel_task->op_code = ACCEL_OPC_COPY_CRC32C;
 
-	if (_is_supported(accel_ch->engine, ACCEL_COPY_CRC32C)) {
-		return accel_ch->engine->submit_tasks(accel_ch->engine_ch, accel_task);
-	} else {
-		rc = _check_flags(flags);
-		if (rc) {
-			return rc;
-		}
-		_sw_accel_copyv(dst, src_iovs, iov_cnt, flags);
-		_sw_accel_crc32cv(crc_dst, src_iovs, iov_cnt, seed);
-		_add_to_comp_list(accel_ch, accel_task, 0);
-		return 0;
+	return engine->submit_tasks(engine_ch, accel_task);
+}
+
+int
+spdk_accel_submit_compress(struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes_dst,
+			   uint64_t nbytes_src, uint32_t *output_size, int flags,
+			   spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
+	struct spdk_accel_task *accel_task;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_COMPRESS];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_COMPRESS];
+
+	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
+	if (accel_task == NULL) {
+		return -ENOMEM;
 	}
+
+	accel_task->output_size = output_size;
+	accel_task->src = src;
+	accel_task->dst = dst;
+	accel_task->nbytes = nbytes_src;
+	accel_task->nbytes_dst = nbytes_dst;
+	accel_task->flags = flags;
+	accel_task->op_code = ACCEL_OPC_COMPRESS;
+
+	return engine->submit_tasks(engine_ch, accel_task);
+
+	return 0;
+}
+
+int
+spdk_accel_submit_decompress(struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes_dst,
+			     uint64_t nbytes_src, int flags, spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct accel_io_channel *accel_ch = spdk_io_channel_get_ctx(ch);
+	struct spdk_accel_task *accel_task;
+	struct spdk_accel_engine *engine = g_engines_opc[ACCEL_OPC_DECOMPRESS];
+	struct spdk_io_channel *engine_ch = accel_ch->engine_ch[ACCEL_OPC_DECOMPRESS];
+
+	accel_task = _get_task(accel_ch, cb_fn, cb_arg);
+	if (accel_task == NULL) {
+		return -ENOMEM;
+	}
+
+	accel_task->src = src;
+	accel_task->dst = dst;
+	accel_task->nbytes = nbytes_src;
+	accel_task->nbytes_dst = nbytes_dst;
+	accel_task->flags = flags;
+	accel_task->op_code = ACCEL_OPC_DECOMPRESS;
+
+	return engine->submit_tasks(engine_ch, accel_task);
+
+	return 0;
 }
 
 /* Helper function when when accel modules register with the framework. */
@@ -490,12 +484,24 @@ accel_engine_create_cb(void *io_device, void *ctx_buf)
 	struct accel_io_channel	*accel_ch = ctx_buf;
 	struct spdk_accel_task *accel_task;
 	uint8_t *task_mem;
-	int i;
+	int i, j;
 
 	accel_ch->task_pool_base = calloc(MAX_TASKS_PER_CHANNEL, g_max_accel_module_size);
 	if (accel_ch->task_pool_base == NULL) {
 		return -ENOMEM;
 	}
+
+#ifdef SPDK_CONFIG_ISAL
+	isal_deflate_stateless_init(&accel_ch->stream);
+	accel_ch->stream.level = 1;
+	accel_ch->stream.level_buf = calloc(1, ISAL_DEF_LVL1_DEFAULT);
+	if (accel_ch->stream.level_buf == NULL) {
+		SPDK_ERRLOG("Could not allocate isal internal buffer\n");
+		goto err;
+	}
+	accel_ch->stream.level_buf_size = ISAL_DEF_LVL1_DEFAULT;
+	isal_inflate_init(&accel_ch->state);
+#endif
 
 	TAILQ_INIT(&accel_ch->task_pool);
 	task_mem = accel_ch->task_pool_base;
@@ -505,22 +511,26 @@ accel_engine_create_cb(void *io_device, void *ctx_buf)
 		task_mem += g_max_accel_module_size;
 	}
 
-	/* Set sw engine channel for operations where hw engine does not support. */
-	accel_ch->sw_engine_ch = g_sw_accel_engine->get_io_channel();
-	assert(accel_ch->sw_engine_ch != NULL);
-
-	if (g_hw_accel_engine != NULL) {
-		accel_ch->engine_ch = g_hw_accel_engine->get_io_channel();
-		accel_ch->engine = g_hw_accel_engine;
-	} else {
-		/* No hw engine enabled, use sw. */
-		accel_ch->engine_ch = accel_ch->sw_engine_ch;
-		accel_ch->engine = g_sw_accel_engine;
+	/* Assign engines and get IO channels for each */
+	for (i = 0; i < ACCEL_OPC_LAST; i++) {
+		accel_ch->engine_ch[i] = g_engines_opc[i]->get_io_channel();
+		/* This can happen if idxd runs out of channels. */
+		if (accel_ch->engine_ch[i] == NULL) {
+			goto err2;
+		}
 	}
-	assert(accel_ch->engine_ch != NULL);
-	accel_ch->engine->capabilities = accel_ch->engine->get_capabilities();
 
 	return 0;
+err2:
+	for (j = 0; j < i; j++) {
+		spdk_put_io_channel(accel_ch->engine_ch[j]);
+	}
+#ifdef SPDK_CONFIG_ISAL
+	free(accel_ch->stream.level_buf);
+err:
+#endif
+	free(accel_ch->task_pool_base);
+	return -ENOMEM;
 }
 
 /* Framework level channel destroy callback. */
@@ -528,11 +538,17 @@ static void
 accel_engine_destroy_cb(void *io_device, void *ctx_buf)
 {
 	struct accel_io_channel	*accel_ch = ctx_buf;
+	int i;
 
-	if (accel_ch->sw_engine_ch != accel_ch->engine_ch) {
-		spdk_put_io_channel(accel_ch->sw_engine_ch);
+	for (i = 0; i < ACCEL_OPC_LAST; i++) {
+		assert(accel_ch->engine_ch[i] != NULL);
+		spdk_put_io_channel(accel_ch->engine_ch[i]);
+		accel_ch->engine_ch[i] = NULL;
 	}
-	spdk_put_io_channel(accel_ch->engine_ch);
+
+#ifdef SPDK_CONFIG_ISAL
+	free(accel_ch->stream.level_buf);
+#endif
 	free(accel_ch->task_pool_base);
 }
 
@@ -555,12 +571,33 @@ accel_engine_module_initialize(void)
 int
 spdk_accel_engine_initialize(void)
 {
-	SPDK_NOTICELOG("Accel engine initialized to use software engine.\n");
+	enum accel_opcode op;
+	struct spdk_accel_engine *accel_engine = NULL;
+
 	accel_engine_module_initialize();
 
+	/* Create our priority global map of opcodes to engines, we populate starting
+	 * with the software engine (guaranteed to be first on the list) and then
+	 * updating opcodes with HW engines that have been initilaized.
+	 * NOTE: all opcodes must be suported by software in the event that no HW
+	 * engines are initilaized to support the operation.
+	 */
+	TAILQ_FOREACH(accel_engine, &g_engine_list, tailq) {
+		for (op = 0; op < ACCEL_OPC_LAST; op++) {
+			if (accel_engine->supports_opcode(op)) {
+				g_engines_opc[op] = accel_engine;
+				SPDK_DEBUGLOG(accel, "OPC 0x%x now assigned to %s\n", op, accel_engine->name);
+			}
+		}
+	}
+#ifdef DEBUG
+	for (op = 0; op < ACCEL_OPC_LAST; op++) {
+		assert(g_engines_opc[op] != NULL);
+	}
+#endif
 	/*
 	 * We need a unique identifier for the accel engine framework, so use the
-	 *  spdk_accel_module_list address for this purpose.
+	 * spdk_accel_module_list address for this purpose.
 	 */
 	spdk_io_device_register(&spdk_accel_module_list, accel_engine_create_cb, accel_engine_destroy_cb,
 				sizeof(struct accel_io_channel), "accel_module");
@@ -632,11 +669,22 @@ spdk_accel_engine_finish(spdk_accel_fini_cb cb_fn, void *cb_arg)
 /*
  * The SW Accelerator module is "built in" here (rest of file)
  */
-static uint64_t
-sw_accel_get_capabilities(void)
+static bool
+sw_accel_supports_opcode(enum accel_opcode opc)
 {
-	/* No HW acceleration capabilities. */
-	return 0;
+	switch (opc) {
+	case ACCEL_OPC_COPY:
+	case ACCEL_OPC_FILL:
+	case ACCEL_OPC_DUALCAST:
+	case ACCEL_OPC_COMPARE:
+	case ACCEL_OPC_CRC32C:
+	case ACCEL_OPC_COPY_CRC32C:
+	case ACCEL_OPC_COMPRESS:
+	case ACCEL_OPC_DECOMPRESS:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static inline void
@@ -736,12 +784,131 @@ _sw_accel_crc32cv(uint32_t *crc_dst, struct iovec *iov, uint32_t iovcnt, uint32_
 	*crc_dst = spdk_crc32c_iov_update(iov, iovcnt, ~seed);
 }
 
+static int
+_sw_accel_compress(struct spdk_accel_task *accel_task)
+{
+#ifdef SPDK_CONFIG_ISAL
+	struct accel_io_channel *accel_ch = accel_task->accel_ch;
+
+	accel_ch->stream.next_in = accel_task->src;
+	accel_ch->stream.next_out = accel_task->dst;
+	accel_ch->stream.avail_in = accel_task->nbytes;
+	accel_ch->stream.avail_out = accel_task->nbytes_dst;
+
+	isal_deflate_stateless(&accel_ch->stream);
+	if (accel_task->output_size != NULL) {
+		assert(accel_task->nbytes_dst > accel_ch->stream.avail_out);
+		*accel_task->output_size = accel_task->nbytes_dst - accel_ch->stream.avail_out;
+	}
+
+	return 0;
+#else
+	SPDK_ERRLOG("ISAL option is required to use software compression.\n");
+	return -EINVAL;
+#endif
+}
+
+static int
+_sw_accel_decompress(struct spdk_accel_task *accel_task)
+{
+#ifdef SPDK_CONFIG_ISAL
+	struct accel_io_channel *accel_ch = accel_task->accel_ch;
+	int rc;
+
+	accel_ch->state.next_in = accel_task->src;
+	accel_ch->state.avail_in = accel_task->nbytes;
+	accel_ch->state.next_out = accel_task->dst;
+	accel_ch->state.avail_out = accel_task->nbytes_dst;
+
+	rc = isal_inflate_stateless(&accel_ch->state);
+	if (rc) {
+		SPDK_ERRLOG("isal_inflate_stateless retunred error %d.\n", rc);
+	}
+	return rc;
+#else
+	SPDK_ERRLOG("ISAL option is required to use software decompression.\n");
+	return -EINVAL;
+#endif
+}
+
+static int
+sw_accel_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *accel_task)
+{
+	struct sw_accel_io_channel *sw_ch = spdk_io_channel_get_ctx(ch);
+	struct spdk_accel_task *tmp;
+	int rc = 0;
+
+	do {
+		switch (accel_task->op_code) {
+		case ACCEL_OPC_COPY:
+			rc = _check_flags(accel_task->flags);
+			if (rc == 0) {
+				_sw_accel_copy(accel_task->dst, accel_task->src, accel_task->nbytes, accel_task->flags);
+			}
+			break;
+		case ACCEL_OPC_FILL:
+			rc = _check_flags(accel_task->flags);
+			if (rc == 0) {
+				_sw_accel_fill(accel_task->dst, accel_task->fill_pattern, accel_task->nbytes, accel_task->flags);
+			}
+			break;
+		case ACCEL_OPC_DUALCAST:
+			rc = _check_flags(accel_task->flags);
+			if (rc == 0) {
+				_sw_accel_dualcast(accel_task->dst, accel_task->dst2, accel_task->src, accel_task->nbytes,
+						   accel_task->flags);
+			}
+			break;
+		case ACCEL_OPC_COMPARE:
+			rc = _sw_accel_compare(accel_task->src, accel_task->src2, accel_task->nbytes);
+			break;
+		case ACCEL_OPC_CRC32C:
+			if (accel_task->v.iovcnt == 0) {
+				_sw_accel_crc32c(accel_task->crc_dst, accel_task->src, accel_task->seed, accel_task->nbytes);
+			} else {
+				_sw_accel_crc32cv(accel_task->crc_dst, accel_task->v.iovs, accel_task->v.iovcnt, accel_task->seed);
+			}
+			break;
+		case ACCEL_OPC_COPY_CRC32C:
+			rc = _check_flags(accel_task->flags);
+			if (rc == 0) {
+				if (accel_task->v.iovcnt == 0) {
+					_sw_accel_copy(accel_task->dst, accel_task->src, accel_task->nbytes, accel_task->flags);
+					_sw_accel_crc32c(accel_task->crc_dst, accel_task->src, accel_task->seed, accel_task->nbytes);
+				} else {
+					_sw_accel_copyv(accel_task->dst, accel_task->v.iovs, accel_task->v.iovcnt, accel_task->flags);
+					_sw_accel_crc32cv(accel_task->crc_dst, accel_task->v.iovs, accel_task->v.iovcnt, accel_task->seed);
+				}
+			}
+			break;
+		case ACCEL_OPC_COMPRESS:
+			rc = _sw_accel_compress(accel_task);
+			break;
+		case ACCEL_OPC_DECOMPRESS:
+			rc = _sw_accel_decompress(accel_task);
+			break;
+		default:
+			assert(false);
+			break;
+		}
+
+		tmp = TAILQ_NEXT(accel_task, link);
+
+		_add_to_comp_list(sw_ch, accel_task, rc);
+
+		accel_task = tmp;
+	} while (accel_task);
+
+	return 0;
+}
+
 static struct spdk_io_channel *sw_accel_get_io_channel(void);
 
-
 static struct spdk_accel_engine sw_accel_engine = {
-	.get_capabilities	= sw_accel_get_capabilities,
+	.name			= "software",
+	.supports_opcode	= sw_accel_supports_opcode,
 	.get_io_channel		= sw_accel_get_io_channel,
+	.submit_tasks		= sw_accel_submit_tasks,
 };
 
 static int
@@ -799,7 +966,8 @@ sw_accel_engine_get_ctx_size(void)
 static int
 sw_accel_engine_init(void)
 {
-	accel_sw_register(&sw_accel_engine);
+	SPDK_NOTICELOG("Accel framework software engine initialized.\n");
+	spdk_accel_engine_register(&sw_accel_engine);
 	spdk_io_device_register(&sw_accel_engine, sw_accel_create_cb, sw_accel_destroy_cb,
 				sizeof(struct sw_accel_io_channel), "sw_accel_engine");
 
@@ -809,8 +977,17 @@ sw_accel_engine_init(void)
 static void
 sw_accel_engine_fini(void *ctxt)
 {
+	struct spdk_accel_engine *accel_engine;
+
 	spdk_io_device_unregister(&sw_accel_engine, NULL);
-	accel_sw_unregister();
+
+	/* unregister the software engine */
+	TAILQ_FOREACH(accel_engine, &g_engine_list, tailq) {
+		if (strcmp(accel_engine->name, "software") == 0) {
+			TAILQ_REMOVE(&g_engine_list, accel_engine, tailq);
+			break;
+		}
+	}
 
 	spdk_accel_engine_module_finish();
 }

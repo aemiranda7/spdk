@@ -87,7 +87,6 @@ cleanup:
 	free_rpc_bdev_pmem_create(&req);
 }
 SPDK_RPC_REGISTER("bdev_pmem_create", rpc_bdev_pmem_create, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_pmem_create, construct_pmem_bdev)
 
 struct rpc_delete_pmem {
 	char *name;
@@ -108,7 +107,11 @@ _rpc_bdev_pmem_delete_cb(void *cb_arg, int bdeverrno)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
 
-	spdk_jsonrpc_send_bool_response(request, bdeverrno == 0);
+	if (bdeverrno == 0) {
+		spdk_jsonrpc_send_bool_response(request, true);
+	} else {
+		spdk_jsonrpc_send_error_response(request, bdeverrno, spdk_strerror(-bdeverrno));
+	}
 }
 
 static void
@@ -116,7 +119,6 @@ rpc_bdev_pmem_delete(struct spdk_jsonrpc_request *request,
 		     const struct spdk_json_val *params)
 {
 	struct rpc_delete_pmem req = {NULL};
-	struct spdk_bdev *bdev;
 
 	if (spdk_json_decode_object(params, rpc_delete_pmem_decoders,
 				    SPDK_COUNTOF(rpc_delete_pmem_decoders),
@@ -124,22 +126,15 @@ rpc_bdev_pmem_delete(struct spdk_jsonrpc_request *request,
 		SPDK_DEBUGLOG(bdev_pmem, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 "spdk_json_decode_object failed");
-	}
-
-	bdev = spdk_bdev_get_by_name(req.name);
-	if (bdev == NULL) {
-		SPDK_DEBUGLOG(bdev_pmem, "bdev '%s' does not exist\n", req.name);
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
 		goto cleanup;
 	}
 
-	delete_pmem_disk(bdev, _rpc_bdev_pmem_delete_cb, request);
+	delete_pmem_disk(req.name, _rpc_bdev_pmem_delete_cb, request);
 
 cleanup:
 	free_rpc_delete_pmem(&req);
 }
 SPDK_RPC_REGISTER("bdev_pmem_delete", rpc_bdev_pmem_delete, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_pmem_delete, delete_pmem_bdev)
 
 struct rpc_bdev_pmem_create_pool {
 	char *pmem_file;
@@ -208,7 +203,6 @@ cleanup:
 	free_rpc_bdev_pmem_create_pool(&req);
 }
 SPDK_RPC_REGISTER("bdev_pmem_create_pool", rpc_bdev_pmem_create_pool, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_pmem_create_pool, create_pmem_pool)
 
 struct rpc_bdev_pmem_get_pool_info {
 	char *pmem_file;
@@ -277,7 +271,6 @@ cleanup:
 	free_rpc_bdev_pmem_get_pool_info(&req);
 }
 SPDK_RPC_REGISTER("bdev_pmem_get_pool_info", rpc_bdev_pmem_get_pool_info, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_pmem_get_pool_info, pmem_pool_info)
 
 struct rpc_bdev_pmem_delete_pool {
 	char *pmem_file;
@@ -326,4 +319,3 @@ cleanup:
 	free_rpc_bdev_pmem_delete_pool(&req);
 }
 SPDK_RPC_REGISTER("bdev_pmem_delete_pool", rpc_bdev_pmem_delete_pool, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_pmem_delete_pool, delete_pmem_pool)

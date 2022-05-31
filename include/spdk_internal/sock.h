@@ -66,6 +66,7 @@ struct spdk_sock {
 	int				cb_cnt;
 	spdk_sock_cb			cb_fn;
 	void				*cb_arg;
+	uint32_t			zerocopy_threshold;
 	struct {
 		uint8_t		closed		: 1;
 		uint8_t		reserved	: 7;
@@ -114,7 +115,8 @@ struct spdk_net_impl {
 	bool (*is_ipv4)(struct spdk_sock *sock);
 	bool (*is_connected)(struct spdk_sock *sock);
 
-	struct spdk_sock_group_impl *(*group_impl_get_optimal)(struct spdk_sock *sock);
+	struct spdk_sock_group_impl *(*group_impl_get_optimal)(struct spdk_sock *sock,
+			struct spdk_sock_group_impl *hint);
 	struct spdk_sock_group_impl *(*group_impl_create)(void);
 	int (*group_impl_add_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);
 	int (*group_impl_remove_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);
@@ -139,17 +141,25 @@ static void __attribute__((constructor)) net_impl_register_##name(void) \
 static inline void
 spdk_sock_request_queue(struct spdk_sock *sock, struct spdk_sock_request *req)
 {
+	assert(req->internal.curr_list == NULL);
 	TAILQ_INSERT_TAIL(&sock->queued_reqs, req, internal.link);
+#ifdef DEBUG
+	req->internal.curr_list = &sock->queued_reqs;
+#endif
 	sock->queued_iovcnt += req->iovcnt;
 }
 
 static inline void
 spdk_sock_request_pend(struct spdk_sock *sock, struct spdk_sock_request *req)
 {
+	assert(req->internal.curr_list == &sock->queued_reqs);
 	TAILQ_REMOVE(&sock->queued_reqs, req, internal.link);
 	assert(sock->queued_iovcnt >= req->iovcnt);
 	sock->queued_iovcnt -= req->iovcnt;
 	TAILQ_INSERT_TAIL(&sock->pending_reqs, req, internal.link);
+#ifdef DEBUG
+	req->internal.curr_list = &sock->pending_reqs;
+#endif
 }
 
 static inline int
@@ -158,9 +168,14 @@ spdk_sock_request_put(struct spdk_sock *sock, struct spdk_sock_request *req, int
 	bool closed;
 	int rc = 0;
 
+	assert(req->internal.curr_list == &sock->pending_reqs);
 	TAILQ_REMOVE(&sock->pending_reqs, req, internal.link);
+#ifdef DEBUG
+	req->internal.curr_list = NULL;
+#endif
 
 	req->internal.offset = 0;
+	req->internal.is_zcopy = 0;
 
 	closed = sock->flags.closed;
 	sock->cb_cnt++;
@@ -189,7 +204,11 @@ spdk_sock_abort_requests(struct spdk_sock *sock)
 
 	req = TAILQ_FIRST(&sock->pending_reqs);
 	while (req) {
+		assert(req->internal.curr_list == &sock->pending_reqs);
 		TAILQ_REMOVE(&sock->pending_reqs, req, internal.link);
+#ifdef DEBUG
+		req->internal.curr_list = NULL;
+#endif
 
 		req->cb_fn(req->cb_arg, -ECANCELED);
 
@@ -198,7 +217,11 @@ spdk_sock_abort_requests(struct spdk_sock *sock)
 
 	req = TAILQ_FIRST(&sock->queued_reqs);
 	while (req) {
+		assert(req->internal.curr_list == &sock->queued_reqs);
 		TAILQ_REMOVE(&sock->queued_reqs, req, internal.link);
+#ifdef DEBUG
+		req->internal.curr_list = NULL;
+#endif
 
 		assert(sock->queued_iovcnt >= req->iovcnt);
 		sock->queued_iovcnt -= req->iovcnt;
@@ -224,11 +247,12 @@ spdk_sock_abort_requests(struct spdk_sock *sock)
 
 static inline int
 spdk_sock_prep_reqs(struct spdk_sock *_sock, struct iovec *iovs, int index,
-		    struct spdk_sock_request **last_req)
+		    struct spdk_sock_request **last_req, int *flags)
 {
 	int iovcnt, i;
 	struct spdk_sock_request *req;
 	unsigned int offset;
+	uint64_t total = 0;
 
 	/* Gather an iov */
 	iovcnt = index;
@@ -254,8 +278,9 @@ spdk_sock_prep_reqs(struct spdk_sock *_sock, struct iovec *iovs, int index,
 
 			iovs[iovcnt].iov_base = SPDK_SOCK_REQUEST_IOV(req, i)->iov_base + offset;
 			iovs[iovcnt].iov_len = SPDK_SOCK_REQUEST_IOV(req, i)->iov_len - offset;
-			iovcnt++;
 
+			total += iovs[iovcnt].iov_len;
+			iovcnt++;
 			offset = 0;
 
 			if (iovcnt >= IOV_BATCH_SIZE) {
@@ -273,6 +298,14 @@ spdk_sock_prep_reqs(struct spdk_sock *_sock, struct iovec *iovs, int index,
 	}
 
 end:
+
+#if defined(MSG_ZEROCOPY)
+	/* if data size < zerocopy_threshold, remove MSG_ZEROCOPY flag */
+	if (total < _sock->zerocopy_threshold && flags != NULL) {
+		*flags = *flags & (~MSG_ZEROCOPY);
+	}
+#endif
+
 	return iovcnt;
 }
 
@@ -323,7 +356,7 @@ void spdk_sock_map_release(struct spdk_sock_map *map, int placement_id);
  * Look up the group for the given placement_id.
  */
 int spdk_sock_map_lookup(struct spdk_sock_map *map, int placement_id,
-			 struct spdk_sock_group_impl **group_impl);
+			 struct spdk_sock_group_impl **group_impl, struct spdk_sock_group_impl *hint);
 
 /**
  * Find a placement id with no associated group

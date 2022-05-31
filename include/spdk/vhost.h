@@ -75,22 +75,42 @@ int spdk_vhost_set_socket_path(const char *basename);
  *
  * \param init_cb Function to be called when the initialization is complete.
  */
-void spdk_vhost_init(spdk_vhost_init_cb init_cb);
+void spdk_vhost_scsi_init(spdk_vhost_init_cb init_cb);
 
 /**
  * Clean up the environment of vhost.
  *
  * \param fini_cb Function to be called when the cleanup is complete.
  */
-void spdk_vhost_fini(spdk_vhost_fini_cb fini_cb);
-
+void spdk_vhost_scsi_fini(spdk_vhost_fini_cb fini_cb);
 
 /**
  * Write vhost subsystem configuration into provided JSON context.
  *
  * \param w JSON write context
  */
-void spdk_vhost_config_json(struct spdk_json_write_ctx *w);
+void spdk_vhost_scsi_config_json(struct spdk_json_write_ctx *w);
+
+/**
+ * Init vhost environment.
+ *
+ * \param init_cb Function to be called when the initialization is complete.
+ */
+void spdk_vhost_blk_init(spdk_vhost_init_cb init_cb);
+
+/**
+ * Clean up the environment of vhost.
+ *
+ * \param fini_cb Function to be called when the cleanup is complete.
+ */
+void spdk_vhost_blk_fini(spdk_vhost_fini_cb fini_cb);
+
+/**
+ * Write vhost subsystem configuration into provided JSON context.
+ *
+ * \param w JSON write context
+ */
+void spdk_vhost_blk_config_json(struct spdk_json_write_ctx *w);
 
 /**
  * Deinit vhost application. This is called once by SPDK app layer.
@@ -312,14 +332,17 @@ int spdk_vhost_scsi_dev_remove_tgt(struct spdk_vhost_dev *vdev, unsigned scsi_tg
  * is allowed but not required. The mask itself can be constructed as:
  * ((1 << cpu0) | (1 << cpu1) | ... | (1 << cpuN)).
  * \param dev_name bdev name to associate with this vhost device
- * \param readonly if set, all writes to the device will fail with
+ * \param transport virtio blk transport name (default: vhost_user_blk)
+ * \param params JSON value object containing variables:
+ * readonly if set, all writes to the device will fail with
  * \c VIRTIO_BLK_S_IOERR error code.
- * \param packed_ring this controller supports packed ring if set.
+ * packed_ring this controller supports packed ring if set.
+ * packed_ring_recovery
  *
  * \return 0 on success, negative errno on error.
  */
 int spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_name,
-			     bool readonly, bool packed_ring);
+			     const char *transport, const struct spdk_json_val *params);
 
 /**
  * Remove a vhost device. The device must not have any open connections on it's socket.

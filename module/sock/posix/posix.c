@@ -95,7 +95,8 @@ static struct spdk_sock_impl_opts g_spdk_posix_sock_impl_opts = {
 	.enable_quickack = false,
 	.enable_placement_id = PLACEMENT_NONE,
 	.enable_zerocopy_send_server = true,
-	.enable_zerocopy_send_client = false
+	.enable_zerocopy_send_client = false,
+	.zerocopy_threshold = 0
 };
 
 static struct spdk_sock_map g_map = {
@@ -366,6 +367,9 @@ posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts)
 	int fd;
 	int val = 1;
 	int rc, sz;
+#if defined(__linux__)
+	int to;
+#endif
 
 	fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 	if (fd < 0) {
@@ -417,6 +421,21 @@ posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts)
 			return -1;
 		}
 	}
+
+	if (opts->ack_timeout) {
+#if defined(__linux__)
+		to = opts->ack_timeout;
+		rc = setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &to, sizeof(to));
+		if (rc != 0) {
+			close(fd);
+			/* error */
+			return -1;
+		}
+#else
+		SPDK_WARNLOG("TCP_USER_TIMEOUT is not supported.\n");
+#endif
+	}
+
 	return fd;
 }
 
@@ -680,14 +699,18 @@ _sock_check_zcopy(struct spdk_sock *sock)
 		for (idx = serr->ee_info; idx <= serr->ee_data; idx++) {
 			found = false;
 			TAILQ_FOREACH_SAFE(req, &sock->pending_reqs, internal.link, treq) {
-				if (req->internal.offset == idx) {
-					found = true;
-
+				if (!req->internal.is_zcopy) {
+					/* This wasn't a zcopy request. It was just waiting in line to complete */
 					rc = spdk_sock_request_put(sock, req, 0);
 					if (rc < 0) {
 						return rc;
 					}
-
+				} else if (req->internal.offset == idx) {
+					found = true;
+					rc = spdk_sock_request_put(sock, req, 0);
+					if (rc < 0) {
+						return rc;
+					}
 				} else if (found) {
 					break;
 				}
@@ -713,29 +736,35 @@ _sock_flush(struct spdk_sock *sock)
 	ssize_t rc;
 	unsigned int offset;
 	size_t len;
+	bool is_zcopy = false;
 
 	/* Can't flush from within a callback or we end up with recursive calls */
 	if (sock->cb_cnt > 0) {
 		return 0;
 	}
 
-	iovcnt = spdk_sock_prep_reqs(sock, iovs, 0, NULL);
+#ifdef SPDK_ZEROCOPY
+	if (psock->zcopy) {
+		flags = MSG_ZEROCOPY | MSG_NOSIGNAL;
+	} else
+#endif
+	{
+		flags = MSG_NOSIGNAL;
+	}
 
+	iovcnt = spdk_sock_prep_reqs(sock, iovs, 0, NULL, &flags);
 	if (iovcnt == 0) {
 		return 0;
 	}
 
+#ifdef SPDK_ZEROCOPY
+	is_zcopy = flags & MSG_ZEROCOPY;
+#endif
+
 	/* Perform the vectored write */
 	msg.msg_iov = iovs;
 	msg.msg_iovlen = iovcnt;
-#ifdef SPDK_ZEROCOPY
-	if (psock->zcopy) {
-		flags = MSG_ZEROCOPY;
-	} else
-#endif
-	{
-		flags = 0;
-	}
+
 	rc = sendmsg(psock->fd, &msg, flags);
 	if (rc <= 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == ENOBUFS && psock->zcopy)) {
@@ -744,18 +773,23 @@ _sock_flush(struct spdk_sock *sock)
 		return rc;
 	}
 
-	/* Handling overflow case, because we use psock->sendmsg_idx - 1 for the
-	 * req->internal.offset, so sendmsg_idx should not be zero  */
-	if (spdk_unlikely(psock->sendmsg_idx == UINT32_MAX)) {
-		psock->sendmsg_idx = 1;
-	} else {
-		psock->sendmsg_idx++;
+	if (is_zcopy) {
+		/* Handling overflow case, because we use psock->sendmsg_idx - 1 for the
+		 * req->internal.offset, so sendmsg_idx should not be zero  */
+		if (spdk_unlikely(psock->sendmsg_idx == UINT32_MAX)) {
+			psock->sendmsg_idx = 1;
+		} else {
+			psock->sendmsg_idx++;
+		}
 	}
 
 	/* Consume the requests that were actually written */
 	req = TAILQ_FIRST(&sock->queued_reqs);
 	while (req) {
 		offset = req->internal.offset;
+
+		/* req->internal.is_zcopy is true when the whole req or part of it is sent with zerocopy */
+		req->internal.is_zcopy = is_zcopy;
 
 		for (i = 0; i < req->iovcnt; i++) {
 			/* Advance by the offset first */
@@ -781,7 +815,7 @@ _sock_flush(struct spdk_sock *sock)
 		/* Handled a full request. */
 		spdk_sock_request_pend(sock, req);
 
-		if (!psock->zcopy) {
+		if (!req->internal.is_zcopy && req == TAILQ_FIRST(&sock->pending_reqs)) {
 			/* The sendmsg syscall above isn't currently asynchronous,
 			* so it's already done. */
 			retval = spdk_sock_request_put(sock, req, 0);
@@ -1081,13 +1115,13 @@ posix_sock_is_connected(struct spdk_sock *_sock)
 }
 
 static struct spdk_sock_group_impl *
-posix_sock_group_impl_get_optimal(struct spdk_sock *_sock)
+posix_sock_group_impl_get_optimal(struct spdk_sock *_sock, struct spdk_sock_group_impl *hint)
 {
 	struct spdk_posix_sock *sock = __posix_sock(_sock);
 	struct spdk_sock_group_impl *group_impl;
 
 	if (sock->placement_id != -1) {
-		spdk_sock_map_lookup(&g_map, sock->placement_id, &group_impl);
+		spdk_sock_map_lookup(&g_map, sock->placement_id, &group_impl, hint);
 		return group_impl;
 	}
 
@@ -1494,6 +1528,7 @@ posix_sock_impl_get_opts(struct spdk_sock_impl_opts *opts, size_t *len)
 	GET_FIELD(enable_placement_id);
 	GET_FIELD(enable_zerocopy_send_server);
 	GET_FIELD(enable_zerocopy_send_client);
+	GET_FIELD(zerocopy_threshold);
 
 #undef GET_FIELD
 #undef FIELD_OK
@@ -1526,6 +1561,7 @@ posix_sock_impl_set_opts(const struct spdk_sock_impl_opts *opts, size_t len)
 	SET_FIELD(enable_placement_id);
 	SET_FIELD(enable_zerocopy_send_server);
 	SET_FIELD(enable_zerocopy_send_client);
+	SET_FIELD(zerocopy_threshold);
 
 #undef SET_FIELD
 #undef FIELD_OK

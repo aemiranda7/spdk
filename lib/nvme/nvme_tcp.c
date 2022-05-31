@@ -59,6 +59,12 @@
 #define NVME_TCP_MAX_R2T_DEFAULT		1
 #define NVME_TCP_PDU_H2C_MIN_DATA_SIZE		4096
 
+/*
+ * Maximum value of transport_ack_timeout used by TCP controller
+ */
+#define NVME_TCP_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT	31
+
+
 /* NVMe TCP transport extensions for spdk_nvme_ctrlr */
 struct nvme_tcp_ctrlr {
 	struct spdk_nvme_ctrlr			ctrlr;
@@ -314,6 +320,8 @@ fail:
 	return -ENOMEM;
 }
 
+static void nvme_tcp_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
+
 static void
 nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
@@ -344,9 +352,10 @@ nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 		 */
 		TAILQ_REMOVE(&tqpair->send_queue, pdu, tailq);
 	}
-}
 
-static void nvme_tcp_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
+	nvme_tcp_qpair_abort_reqs(qpair, 0);
+	nvme_transport_ctrlr_disconnect_qpair_done(qpair);
+}
 
 static int
 nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
@@ -1924,6 +1933,9 @@ nvme_tcp_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpai
 	spdk_sock_get_default_opts(&opts);
 	opts.priority = ctrlr->trid.priority;
 	opts.zcopy = !nvme_qpair_is_admin_queue(qpair);
+	if (ctrlr->opts.transport_ack_timeout) {
+		opts.ack_timeout = 1ULL << ctrlr->opts.transport_ack_timeout;
+	}
 	tqpair->sock = spdk_sock_connect_ext(ctrlr->trid.traddr, port, NULL, &opts);
 	if (!tqpair->sock) {
 		SPDK_ERRLOG("sock connection error of tqpair=%p with addr=%s, port=%ld\n",
@@ -2117,6 +2129,12 @@ static struct spdk_nvme_ctrlr *nvme_tcp_ctrlr_construct(const struct spdk_nvme_t
 	tctrlr->ctrlr.opts = *opts;
 	tctrlr->ctrlr.trid = *trid;
 
+	if (opts->transport_ack_timeout > NVME_TCP_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT) {
+		SPDK_NOTICELOG("transport_ack_timeout exceeds max value %d, use max value\n",
+			       NVME_TCP_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT);
+		tctrlr->ctrlr.opts.transport_ack_timeout = NVME_TCP_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT;
+	}
+
 	rc = nvme_ctrlr_construct(&tctrlr->ctrlr);
 	if (rc != 0) {
 		free(tctrlr);
@@ -2233,7 +2251,7 @@ nvme_tcp_qpair_get_optimal_poll_group(struct spdk_nvme_qpair *qpair)
 	struct spdk_sock_group *group = NULL;
 	int rc;
 
-	rc = spdk_sock_get_optimal_sock_group(tqpair->sock, &group);
+	rc = spdk_sock_get_optimal_sock_group(tqpair->sock, &group, NULL);
 	if (!rc && group != NULL) {
 		return spdk_sock_group_get_ctx(group);
 	}
@@ -2294,13 +2312,20 @@ nvme_tcp_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 			   struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_tcp_qpair *tqpair;
+	struct nvme_tcp_poll_group *group;
 
 	assert(qpair->poll_group_tailq_head == &tgroup->disconnected_qpairs);
 
 	tqpair = nvme_tcp_qpair(qpair);
+	group = nvme_tcp_poll_group(tgroup);
 
 	assert(tqpair->shared_stats == true);
 	tqpair->stats = &g_dummy_stats;
+
+	if (tqpair->needs_poll) {
+		TAILQ_REMOVE(&group->needs_poll, tqpair, link);
+		tqpair->needs_poll = false;
+	}
 
 	return 0;
 }

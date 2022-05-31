@@ -465,7 +465,6 @@ nvme_transport_connect_qpair_fail(struct spdk_nvme_qpair *qpair, void *unused)
 	/* If the qpair was unable to reconnect, restore the original failure reason */
 	qpair->transport_failure_reason = qpair->last_transport_failure_reason;
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
-	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
 }
 
 int
@@ -515,6 +514,12 @@ nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nv
 	return 0;
 err:
 	nvme_transport_connect_qpair_fail(qpair, NULL);
+	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
+		assert(qpair->async == true);
+		/* Let the caller to poll the qpair until it is actually disconnected. */
+		return 0;
+	}
+
 	return rc;
 }
 
@@ -535,9 +540,12 @@ nvme_transport_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk
 	}
 
 	transport->ops.ctrlr_disconnect_qpair(ctrlr, qpair);
+}
 
+void
+nvme_transport_ctrlr_disconnect_qpair_done(struct spdk_nvme_qpair *qpair)
+{
 	nvme_qpair_abort_all_queued_reqs(qpair, 0);
-	nvme_transport_qpair_abort_reqs(qpair, 0);
 	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
 }
 
@@ -707,39 +715,8 @@ int64_t
 nvme_transport_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
 {
-	struct spdk_nvme_qpair *qpair;
-	int64_t rc;
-
-	tgroup->in_completion_context = true;
-	rc = tgroup->transport->ops.poll_group_process_completions(tgroup, completions_per_qpair,
+	return tgroup->transport->ops.poll_group_process_completions(tgroup, completions_per_qpair,
 			disconnected_qpair_cb);
-	tgroup->in_completion_context = false;
-
-	if (spdk_unlikely(tgroup->num_qpairs_to_delete > 0)) {
-		/* deleted qpairs are more likely to be in the disconnected qpairs list. */
-		STAILQ_FOREACH(qpair, &tgroup->disconnected_qpairs, poll_group_stailq) {
-			if (spdk_unlikely(qpair->delete_after_completion_context)) {
-				spdk_nvme_ctrlr_free_io_qpair(qpair);
-				if (--tgroup->num_qpairs_to_delete == 0) {
-					return rc;
-				}
-			}
-		}
-
-		STAILQ_FOREACH(qpair, &tgroup->connected_qpairs, poll_group_stailq) {
-			if (spdk_unlikely(qpair->delete_after_completion_context)) {
-				spdk_nvme_ctrlr_free_io_qpair(qpair);
-				if (--tgroup->num_qpairs_to_delete == 0) {
-					return rc;
-				}
-			}
-		}
-		/* Just in case. */
-		SPDK_DEBUGLOG(nvme, "Mismatch between qpairs to delete and poll group number.\n");
-		tgroup->num_qpairs_to_delete = 0;
-	}
-
-	return rc;
 }
 
 int

@@ -3,7 +3,7 @@
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
  *   Copyright (c) 2020, 2021 Mellanox Technologies LTD. All rights reserved.
- *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2021, 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -162,6 +162,12 @@ extern pid_t g_spdk_nvme_pid;
  * Maximum Data Transfer Size(MDTS) excludes interleaved metadata.
  */
 #define NVME_QUIRK_MDTS_EXCLUDE_MD 0x8000
+
+/**
+ * Force not to use SGL even the controller report that it can
+ * support it.
+ */
+#define NVME_QUIRK_NOT_USE_SGL 0x10000
 
 #define NVME_MAX_ASYNC_EVENTS	(8)
 
@@ -446,7 +452,7 @@ struct spdk_nvme_qpair {
 	 */
 	uint8_t					no_deletion_notification_needed: 1;
 
-	uint8_t					first_fused_submitted: 1;
+	uint8_t					last_fuse: 2;
 
 	uint8_t					transport_failure_reason: 2;
 	uint8_t					last_transport_failure_reason: 2;
@@ -502,8 +508,6 @@ struct spdk_nvme_transport_poll_group {
 	STAILQ_HEAD(, spdk_nvme_qpair)			connected_qpairs;
 	STAILQ_HEAD(, spdk_nvme_qpair)			disconnected_qpairs;
 	STAILQ_ENTRY(spdk_nvme_transport_poll_group)	link;
-	bool						in_completion_context;
-	uint64_t					num_qpairs_to_delete;
 };
 
 struct spdk_nvme_ns {
@@ -627,6 +631,11 @@ enum nvme_ctrlr_state {
 	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 0.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0_WAIT_FOR_CSTS,
+
+	/**
+	 * The controller is disabled. (CC.EN and CSTS.RDY are 0.)
+	 */
+	NVME_CTRLR_STATE_DISABLED,
 
 	/**
 	 * Enable the controller by writing CC.EN to 1
@@ -889,6 +898,8 @@ struct spdk_nvme_ctrlr {
 	 */
 	bool				prepare_for_reset;
 
+	bool				is_disconnecting;
+
 	uint16_t			max_sges;
 
 	uint16_t			cntlid;
@@ -1046,10 +1057,6 @@ struct spdk_nvme_detach_ctx {
 	TAILQ_HEAD(, nvme_ctrlr_detach_ctx)	head;
 };
 
-struct spdk_nvme_ctrlr_reset_ctx {
-	struct spdk_nvme_ctrlr			*ctrlr;
-};
-
 struct nvme_driver {
 	pthread_mutex_t			lock;
 
@@ -1178,6 +1185,8 @@ int	nvme_ctrlr_destruct_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 				       struct nvme_ctrlr_detach_ctx *ctx);
 void	nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove);
 int	nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr);
+void	nvme_ctrlr_disable(struct spdk_nvme_ctrlr *ctrlr);
+int	nvme_ctrlr_disable_poll(struct spdk_nvme_ctrlr *ctrlr);
 void	nvme_ctrlr_connected(struct spdk_nvme_probe_ctx *probe_ctx,
 			     struct spdk_nvme_ctrlr *ctrlr);
 
@@ -1517,6 +1526,7 @@ int nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 				       struct spdk_nvme_qpair *qpair);
 void nvme_transport_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair);
+void nvme_transport_ctrlr_disconnect_qpair_done(struct spdk_nvme_qpair *qpair);
 int nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_memory_domain **domains, int array_size);
 void nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);

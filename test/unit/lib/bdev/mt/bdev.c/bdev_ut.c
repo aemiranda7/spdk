@@ -48,6 +48,34 @@ DEFINE_STUB(spdk_notify_send, uint64_t, (const char *type, const char *ctx), 0);
 DEFINE_STUB(spdk_notify_type_register, struct spdk_notify_type *, (const char *type), NULL);
 DEFINE_STUB_V(spdk_scsi_nvme_translate, (const struct spdk_bdev_io *bdev_io, int *sc, int *sk,
 		int *asc, int *ascq));
+DEFINE_STUB(spdk_memory_domain_get_dma_device_id, const char *, (struct spdk_memory_domain *domain),
+	    "test_domain");
+DEFINE_STUB(spdk_memory_domain_get_dma_device_type, enum spdk_dma_device_type,
+	    (struct spdk_memory_domain *domain), 0);
+
+DEFINE_RETURN_MOCK(spdk_memory_domain_pull_data, int);
+int
+spdk_memory_domain_pull_data(struct spdk_memory_domain *src_domain, void *src_domain_ctx,
+			     struct iovec *src_iov, uint32_t src_iov_cnt, struct iovec *dst_iov, uint32_t dst_iov_cnt,
+			     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
+{
+	HANDLE_RETURN_MOCK(spdk_memory_domain_pull_data);
+
+	cpl_cb(cpl_cb_arg, 0);
+	return 0;
+}
+
+DEFINE_RETURN_MOCK(spdk_memory_domain_push_data, int);
+int
+spdk_memory_domain_push_data(struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
+			     struct iovec *dst_iov, uint32_t dst_iovcnt, struct iovec *src_iov, uint32_t src_iovcnt,
+			     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
+{
+	HANDLE_RETURN_MOCK(spdk_memory_domain_push_data);
+
+	cpl_cb(cpl_cb_arg, 0);
+	return 0;
+}
 
 struct ut_bdev {
 	struct spdk_bdev	bdev;
@@ -176,7 +204,6 @@ stub_complete_io(void *io_target, uint32_t num_to_complete)
 		ch->avail_cnt++;
 		num_completed++;
 	}
-
 	spdk_put_io_channel(_ch);
 	return num_completed;
 }
@@ -253,6 +280,8 @@ unregister_bdev(struct ut_bdev *ut_bdev)
 	/* Handle any deferred messages. */
 	poll_threads();
 	spdk_bdev_unregister(&ut_bdev->bdev, NULL, NULL);
+	/* Handle the async bdev unregister. */
+	poll_threads();
 }
 
 static void
@@ -1191,6 +1220,59 @@ enomem_multi_bdev(void)
 	teardown_test();
 }
 
+static void
+enomem_multi_bdev_unregister(void)
+{
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *bdev_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
+	struct ut_bdev_channel *ut_ch;
+	const uint32_t IO_ARRAY_SIZE = 64;
+	const uint32_t AVAIL = 20;
+	enum spdk_bdev_io_status status[IO_ARRAY_SIZE];
+	uint32_t i;
+	int rc;
+
+	setup_test();
+
+	set_thread(0);
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	shared_resource = bdev_ch->shared_resource;
+	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
+	ut_ch->avail_cnt = AVAIL;
+
+	/* Saturate io_target through the bdev. */
+	for (i = 0; i < AVAIL; i++) {
+		status[i] = SPDK_BDEV_IO_STATUS_PENDING;
+		rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[i]);
+		CU_ASSERT(rc == 0);
+	}
+	CU_ASSERT(TAILQ_EMPTY(&shared_resource->nomem_io));
+
+	/*
+	 * Now submit I/O through the bdev. This should fail with ENOMEM
+	 * and then go onto the nomem_io list.
+	 */
+	status[AVAIL] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[AVAIL]);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&shared_resource->nomem_io));
+
+	/* Unregister the bdev to abort the IOs from nomem_io queue. */
+	unregister_bdev(&g_bdev);
+	CU_ASSERT(status[AVAIL] == SPDK_BDEV_IO_STATUS_FAILED);
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&shared_resource->nomem_io));
+	SPDK_CU_ASSERT_FATAL(shared_resource->io_outstanding == AVAIL);
+
+	/* Complete the bdev's I/O. */
+	stub_complete_io(g_bdev.io_target, AVAIL);
+	SPDK_CU_ASSERT_FATAL(shared_resource->io_outstanding == 0);
+
+	spdk_put_io_channel(io_ch);
+	poll_threads();
+	teardown_test();
+}
 
 static void
 enomem_multi_io_target(void)
@@ -1955,6 +2037,73 @@ lock_lba_range_then_submit_io(void)
 	teardown_test();
 }
 
+/* spdk_bdev_reset() freezes and unfreezes I/O channels by using spdk_for_each_channel().
+ * spdk_bdev_unregister() calls spdk_io_device_unregister() in the end. However
+ * spdk_io_device_unregister() fails if it is called while executing spdk_for_each_channel().
+ * Hence, in this case, spdk_io_device_unregister() is deferred until spdk_bdev_reset()
+ * completes. Test this behavior.
+ */
+static void
+unregister_during_reset(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	bool done_reset = false, done_unregister = false;
+	int rc;
+
+	setup_test();
+	set_thread(0);
+
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	SPDK_CU_ASSERT_FATAL(io_ch[0] != NULL);
+
+	set_thread(1);
+
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	SPDK_CU_ASSERT_FATAL(io_ch[1] != NULL);
+
+	set_thread(0);
+
+	CU_ASSERT(g_bdev.bdev.internal.reset_in_progress == NULL);
+
+	rc = spdk_bdev_reset(g_desc, io_ch[0], reset_done, &done_reset);
+	CU_ASSERT(rc == 0);
+
+	set_thread(0);
+
+	poll_thread_times(0, 1);
+
+	spdk_bdev_close(g_desc);
+	spdk_bdev_unregister(&g_bdev.bdev, _bdev_unregistered, &done_unregister);
+
+	CU_ASSERT(done_reset == false);
+	CU_ASSERT(done_unregister == false);
+
+	poll_threads();
+
+	stub_complete_io(g_bdev.io_target, 0);
+
+	poll_threads();
+
+	CU_ASSERT(done_reset == true);
+	CU_ASSERT(done_unregister == false);
+
+	spdk_put_io_channel(io_ch[0]);
+
+	set_thread(1);
+
+	spdk_put_io_channel(io_ch[1]);
+
+	poll_threads();
+
+	CU_ASSERT(done_unregister == true);
+
+	/* Restore the original g_bdev so that we can use teardown_test(). */
+	set_thread(0);
+	register_bdev(&g_bdev, "ut_bdev", &g_io_device);
+	spdk_bdev_open_ext("ut_bdev", true, _bdev_event_cb, NULL, &g_desc);
+	teardown_test();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1976,11 +2125,13 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, io_during_qos_reset);
 	CU_ADD_TEST(suite, enomem);
 	CU_ADD_TEST(suite, enomem_multi_bdev);
+	CU_ADD_TEST(suite, enomem_multi_bdev_unregister);
 	CU_ADD_TEST(suite, enomem_multi_io_target);
 	CU_ADD_TEST(suite, qos_dynamic_enable);
 	CU_ADD_TEST(suite, bdev_histograms_mt);
 	CU_ADD_TEST(suite, bdev_set_io_timeout_mt);
 	CU_ADD_TEST(suite, lock_lba_range_then_submit_io);
+	CU_ADD_TEST(suite, unregister_during_reset);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

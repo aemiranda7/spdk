@@ -114,7 +114,6 @@ cleanup:
 	free_rpc_bdev_error_create(&req);
 }
 SPDK_RPC_REGISTER("bdev_error_create", rpc_bdev_error_create, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_error_create, construct_error_bdev)
 
 struct rpc_delete_error {
 	char *name;
@@ -135,7 +134,11 @@ rpc_bdev_error_delete_cb(void *cb_arg, int bdeverrno)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
 
-	spdk_jsonrpc_send_bool_response(request, bdeverrno == 0);
+	if (bdeverrno == 0) {
+		spdk_jsonrpc_send_bool_response(request, true);
+	} else {
+		spdk_jsonrpc_send_error_response(request, bdeverrno, spdk_strerror(-bdeverrno));
+	}
 }
 
 static void
@@ -143,7 +146,6 @@ rpc_bdev_error_delete(struct spdk_jsonrpc_request *request,
 		      const struct spdk_json_val *params)
 {
 	struct rpc_delete_error req = {NULL};
-	struct spdk_bdev *vbdev;
 
 	if (spdk_json_decode_object(params, rpc_delete_error_decoders,
 				    SPDK_COUNTOF(rpc_delete_error_decoders),
@@ -153,19 +155,12 @@ rpc_bdev_error_delete(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	vbdev = spdk_bdev_get_by_name(req.name);
-	if (vbdev == NULL) {
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	vbdev_error_delete(vbdev, rpc_bdev_error_delete_cb, request);
+	vbdev_error_delete(req.name, rpc_bdev_error_delete_cb, request);
 
 cleanup:
 	free_rpc_delete_error(&req);
 }
 SPDK_RPC_REGISTER("bdev_error_delete", rpc_bdev_error_delete, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_error_delete, delete_error_bdev)
 
 struct rpc_error_information {
 	char *name;
@@ -233,4 +228,3 @@ cleanup:
 	free_rpc_error_information(&req);
 }
 SPDK_RPC_REGISTER("bdev_error_inject_error", rpc_bdev_error_inject_error, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_error_inject_error, bdev_inject_error)

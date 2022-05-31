@@ -71,7 +71,7 @@ ifeq ($(CONFIG_VFIO_USER),y)
 DEPDIRS-nvme += vfio_user
 endif
 
-DEPDIRS-blob := log util thread
+DEPDIRS-blob := log util thread dma
 DEPDIRS-accel := log util thread json
 DEPDIRS-jsonrpc := log util json
 DEPDIRS-virtio := log util json thread
@@ -83,7 +83,7 @@ DEPDIRS-net := log util $(JSON_LIBS)
 DEPDIRS-notify := log util $(JSON_LIBS)
 DEPDIRS-trace := log util $(JSON_LIBS)
 
-DEPDIRS-bdev := log util thread $(JSON_LIBS) notify trace
+DEPDIRS-bdev := log util thread $(JSON_LIBS) notify trace dma
 DEPDIRS-blobfs := log thread blob trace
 DEPDIRS-event := log util thread $(JSON_LIBS) trace init
 DEPDIRS-init := jsonrpc json log rpc thread util
@@ -119,7 +119,8 @@ endif
 
 # module/accel
 DEPDIRS-accel_ioat := log ioat thread jsonrpc rpc accel
-DEPDIRS-accel_idxd := log idxd thread $(JSON_LIBS) accel trace
+DEPDIRS-accel_dsa := log idxd thread $(JSON_LIBS) accel trace
+DEPDIRS-accel_iaa := log idxd thread $(JSON_LIBS) accel trace
 
 # module/env_dpdk
 DEPDIRS-env_dpdk_rpc := log $(JSON_LIBS)
@@ -129,7 +130,7 @@ DEPDIRS-sock_posix := log sock util
 DEPDIRS-sock_uring := log sock util
 
 # module/scheduler
-DEPDIRS-scheduler_dynamic := event log thread util
+DEPDIRS-scheduler_dynamic := event log thread util json
 ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))
 ifeq ($(OS),Linux)
 DEPDIRS-scheduler_dpdk_governor := event log
@@ -184,5 +185,6 @@ DEPDIRS-event_nvmf := init nvmf event_bdev event_scheduler event_sock thread log
 DEPDIRS-event_scsi := init scsi event_bdev
 
 DEPDIRS-event_iscsi := init iscsi event_scheduler event_scsi event_sock
-DEPDIRS-event_vhost := init vhost event_scheduler event_scsi
+DEPDIRS-event_vhost_blk := init vhost
+DEPDIRS-event_vhost_scsi := init vhost event_scheduler event_scsi
 DEPDIRS-event_sock := init sock

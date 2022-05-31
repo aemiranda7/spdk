@@ -38,15 +38,23 @@
 
 #include "spdk/accel_engine.h"
 #include "spdk/queue.h"
+#include "spdk/config.h"
+
+#ifdef SPDK_CONFIG_ISAL
+#include "../isa-l/include/igzip_lib.h"
+#endif
 
 struct spdk_accel_task;
 
 void spdk_accel_task_complete(struct spdk_accel_task *task, int status);
 
 struct accel_io_channel {
-	struct spdk_accel_engine	*engine;
-	struct spdk_io_channel		*engine_ch;
-	struct spdk_io_channel		*sw_engine_ch;
+	struct spdk_io_channel		*engine_ch[ACCEL_OPC_LAST];
+	/* for ISAL */
+#ifdef SPDK_CONFIG_ISAL
+	struct isal_zstream		stream;
+	struct inflate_state		state;
+#endif
 	void				*task_pool_base;
 	TAILQ_HEAD(, spdk_accel_task)	task_pool;
 };
@@ -54,16 +62,6 @@ struct accel_io_channel {
 struct sw_accel_io_channel {
 	struct spdk_poller		*completion_poller;
 	TAILQ_HEAD(, spdk_accel_task)	tasks_to_complete;
-};
-
-enum accel_opcode {
-	ACCEL_OPCODE_MEMMOVE		= 0,
-	ACCEL_OPCODE_MEMFILL		= 1,
-	ACCEL_OPCODE_COMPARE		= 2,
-	ACCEL_OPCODE_BATCH		= 3,
-	ACCEL_OPCODE_CRC32C		= 4,
-	ACCEL_OPCODE_DUALCAST		= 5,
-	ACCEL_OPCODE_COPY_CRC32C	= 6,
 };
 
 struct spdk_accel_task {
@@ -86,19 +84,24 @@ struct spdk_accel_task {
 		uint32_t			seed;
 		uint64_t			fill_pattern;
 	};
-	uint32_t			*crc_dst;
+	union {
+		uint32_t		*crc_dst;
+		uint32_t		*output_size;
+	};
 	enum accel_opcode		op_code;
 	uint64_t			nbytes;
+	uint64_t			nbytes_dst;
 	int				flags;
 	int				status;
 	TAILQ_ENTRY(spdk_accel_task)	link;
 };
 
 struct spdk_accel_engine {
-	uint64_t capabilities;
-	uint64_t (*get_capabilities)(void);
+	const char *name;
+	bool (*supports_opcode)(enum accel_opcode);
 	struct spdk_io_channel *(*get_io_channel)(void);
 	int (*submit_tasks)(struct spdk_io_channel *ch, struct spdk_accel_task *accel_task);
+	TAILQ_ENTRY(spdk_accel_engine) tailq;
 };
 
 struct spdk_accel_module_if {
@@ -129,7 +132,7 @@ struct spdk_accel_module_if {
 	TAILQ_ENTRY(spdk_accel_module_if)	tailq;
 };
 
-void spdk_accel_hw_engine_register(struct spdk_accel_engine *accel_engine);
+void spdk_accel_engine_register(struct spdk_accel_engine *accel_engine);
 void spdk_accel_module_list_add(struct spdk_accel_module_if *accel_module);
 
 #define SPDK_ACCEL_MODULE_REGISTER(init_fn, fini_fn, config_json, ctx_size_fn)				\

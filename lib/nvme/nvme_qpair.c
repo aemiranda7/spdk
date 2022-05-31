@@ -136,6 +136,7 @@ static const struct nvme_string sgl_type[] = {
 	{ SPDK_NVME_SGL_TYPE_BIT_BUCKET, "BIT BUCKET" },
 	{ SPDK_NVME_SGL_TYPE_SEGMENT, "SEGMENT" },
 	{ SPDK_NVME_SGL_TYPE_LAST_SEGMENT, "LAST SEGMENT" },
+	{ SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK, "KEYED DATA BLOCK" },
 	{ SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK, "TRANSPORT DATA BLOCK" },
 	{ SPDK_NVME_SGL_TYPE_VENDOR_SPECIFIC, "VENDOR SPECIFIC" },
 	{ 0xFFFF, "RESERVED" }
@@ -191,11 +192,11 @@ nvme_get_sgl(char *buf, size_t size, struct spdk_nvme_cmd *cmd)
 		     nvme_get_string(sgl_subtype, sgl->generic.subtype), sgl->address);
 	assert(c >= 0 && (size_t)c < size);
 
-	if (sgl->generic.type == SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK) {
+	if (sgl->generic.type == SPDK_NVME_SGL_TYPE_DATA_BLOCK) {
 		nvme_get_sgl_unkeyed(buf + c, size - c, cmd);
 	}
 
-	if (sgl->generic.type == SPDK_NVME_SGL_TYPE_DATA_BLOCK) {
+	if (sgl->generic.type == SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK) {
 		nvme_get_sgl_keyed(buf + c, size - c, cmd);
 	}
 }
@@ -560,7 +561,7 @@ nvme_qpair_abort_queued_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 			SPDK_ERRLOG("aborting queued i/o\n");
 		}
 		nvme_qpair_manual_complete_request(qpair, req, SPDK_NVME_SCT_GENERIC,
-						   SPDK_NVME_SC_ABORTED_BY_REQUEST, dnr, true);
+						   SPDK_NVME_SC_ABORTED_SQ_DELETION, dnr, true);
 	}
 }
 
@@ -597,14 +598,17 @@ nvme_qpair_abort_queued_reqs_with_cbarg(struct spdk_nvme_qpair *qpair, void *cmd
 	uint32_t		aborting = 0;
 
 	STAILQ_FOREACH_SAFE(req, &qpair->queued_req, stailq, tmp) {
-		if (req->cb_arg == cmd_cb_arg) {
-			STAILQ_REMOVE(&qpair->queued_req, req, nvme_request, stailq);
-			STAILQ_INSERT_TAIL(&qpair->aborting_queued_req, req, stailq);
-			if (!qpair->ctrlr->opts.disable_error_logging) {
-				SPDK_ERRLOG("aborting queued i/o\n");
-			}
-			aborting++;
+		if ((req->cb_arg != cmd_cb_arg) &&
+		    (req->parent == NULL || req->parent->cb_arg != cmd_cb_arg)) {
+			continue;
 		}
+
+		STAILQ_REMOVE(&qpair->queued_req, req, nvme_request, stailq);
+		STAILQ_INSERT_TAIL(&qpair->aborting_queued_req, req, stailq);
+		if (!qpair->ctrlr->opts.disable_error_logging) {
+			SPDK_ERRLOG("aborting queued i/o\n");
+		}
+		aborting++;
 	}
 
 	return aborting;
@@ -719,7 +723,8 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	int32_t ret;
 	struct nvme_request *req, *tmp;
 
-	if (spdk_unlikely(qpair->ctrlr->is_failed)) {
+	if (spdk_unlikely(qpair->ctrlr->is_failed &&
+			  nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTING)) {
 		if (qpair->ctrlr->is_removed) {
 			nvme_qpair_set_state(qpair, NVME_QPAIR_DESTROYING);
 			nvme_qpair_abort_all_queued_reqs(qpair, 0);
@@ -729,7 +734,8 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	}
 
 	if (spdk_unlikely(!nvme_qpair_check_enabled(qpair) &&
-			  !(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING))) {
+			  !(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING ||
+			    nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING))) {
 		/*
 		 * qpair is not enabled, likely because a controller reset is
 		 *  in progress.
@@ -752,9 +758,14 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	qpair->in_completion_context = 1;
 	ret = nvme_transport_qpair_process_completions(qpair, max_completions);
 	if (ret < 0) {
-		SPDK_ERRLOG("CQ transport error %d (%s) on qpair id %hu\n", ret, spdk_strerror(-ret), qpair->id);
-		if (nvme_qpair_is_admin_queue(qpair)) {
-			nvme_ctrlr_fail(qpair->ctrlr, false);
+		if (ret == -ENXIO && nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
+			ret = 0;
+		} else {
+			SPDK_ERRLOG("CQ transport error %d (%s) on qpair id %hu\n",
+				    ret, spdk_strerror(-ret), qpair->id);
+			if (nvme_qpair_is_admin_queue(qpair)) {
+				nvme_ctrlr_fail(qpair->ctrlr, false);
+			}
 		}
 	}
 	qpair->in_completion_context = 0;

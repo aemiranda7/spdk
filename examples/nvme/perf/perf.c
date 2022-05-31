@@ -1210,13 +1210,6 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		return;
 	}
 
-	if (g_io_size_bytes % sector_size != 0) {
-		printf("WARNING: IO size %u (-o) is not a multiple of nsid %u sector size %u."
-		       " Removing this ns from test\n", g_io_size_bytes, spdk_nvme_ns_get_id(ns), sector_size);
-		g_warn = true;
-		return;
-	}
-
 	max_xfer_size = spdk_nvme_ns_get_max_io_xfer_size(ns);
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
 	/* NVMe driver may add additional entries based on
@@ -1271,6 +1264,15 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	 */
 	if ((entry->io_flags & SPDK_NVME_IO_FLAGS_PRACT) && (entry->md_size == 8)) {
 		entry->block_size = spdk_nvme_ns_get_sector_size(ns);
+	}
+
+	if (g_io_size_bytes % entry->block_size != 0) {
+		printf("WARNING: IO size %u (-o) is not a multiple of nsid %u sector size %u."
+		       " Removing this ns from test\n", g_io_size_bytes, spdk_nvme_ns_get_id(ns), entry->block_size);
+		g_warn = true;
+		spdk_zipf_free(&entry->zipf);
+		free(entry);
+		return;
 	}
 
 	if (g_max_io_md_size < entry->md_size) {
@@ -1672,6 +1674,7 @@ work_fn(void *arg)
 				TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
 					ns_ctx->stats.min_tsc = UINT64_MAX;
+					spdk_histogram_data_reset(ns_ctx->histogram);
 				}
 
 				if (worker->lcore == g_main_core && isatty(STDOUT_FILENO)) {
@@ -2052,9 +2055,6 @@ add_trid(const char *trid_str)
 		free(trid_entry);
 		return 1;
 	}
-
-	spdk_nvme_transport_id_populate_trstring(trid,
-			spdk_nvme_transport_id_trtype_str(trid->trtype));
 
 	ns = strcasestr(trid_str, "ns:");
 	if (ns) {

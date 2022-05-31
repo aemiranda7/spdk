@@ -114,6 +114,7 @@ struct spdk_uuid;
 enum spdk_bdev_status {
 	SPDK_BDEV_STATUS_INVALID,
 	SPDK_BDEV_STATUS_READY,
+	SPDK_BDEV_STATUS_UNREGISTERING,
 	SPDK_BDEV_STATUS_REMOVING,
 };
 
@@ -377,6 +378,44 @@ int spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t e
  * \param desc Block device descriptor to close.
  */
 void spdk_bdev_close(struct spdk_bdev_desc *desc);
+
+/**
+ * Callback function for spdk_for_each_bdev() and spdk_for_each_bdev_leaf().
+ *
+ * \param ctx Context passed to the callback.
+ * \param bdev Block device the callback handles.
+ */
+typedef int (*spdk_for_each_bdev_fn)(void *ctx, struct spdk_bdev *bdev);
+
+/**
+ * Call the provided callback function for every registered block device.
+ * If fn returns negated errno, spdk_for_each_bdev() terminates iteration.
+ *
+ * spdk_for_each_bdev() opens before and closes after executing the provided
+ * callback function for each bdev internally.
+ *
+ * \param ctx Context passed to the callback function.
+ * \param fn Callback function for each block device.
+ *
+ * \return 0 if operation is sucessful, or suitable errno value one of the
+ * callback returned otherwise.
+ */
+int spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn);
+
+/**
+ * Call the provided callback function for every block device without virtual
+ * block devices on top.
+ *
+ * spdk_for_each_bdev_leaf() opens before and closes after executing the provided
+ * callback function for each unclaimed bdev internally.
+ *
+ * \param ctx Context passed to the callback function.
+ * \param fn Callback funciton for each block device without virtual block devices on top.
+ *
+ * \return 0 if operation is successful, or suitable errno value one of the
+ * callback returned otherwise.
+ */
+int spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn);
 
 /**
  * Get the bdev associated with a bdev descriptor.
@@ -934,7 +973,8 @@ int spdk_bdev_readv_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_c
  * \param cb Called when the request is complete.
  * \param cb_arg Argument passed to cb.
  * \param opts Optional structure with extended IO request options. If set, this structure must be
- * valid until the IO is completed.
+ * valid until the IO is completed. `size` member of this structure is used for ABI compatibility and
+ * must be set to sizeof(struct spdk_bdev_ext_io_opts).
  *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
@@ -1136,7 +1176,8 @@ int spdk_bdev_writev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_
  * \param cb Called when the request is complete.
  * \param cb_arg Argument passed to cb.
  * \param opts Optional structure with extended IO request options. If set, this structure must be
- * valid until the IO is completed.
+ * valid until the IO is completed. `size` member of this structure is used for ABI compatibility and
+ * must be set to sizeof(struct spdk_bdev_ext_io_opts).
  *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return

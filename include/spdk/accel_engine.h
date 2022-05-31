@@ -47,14 +47,16 @@ extern "C" {
 /* Flags for accel operations */
 #define ACCEL_FLAG_PERSISTENT (1 << 0)
 
-enum accel_capability {
-	ACCEL_COPY		= 1 << 0,
-	ACCEL_FILL		= 1 << 1,
-	ACCEL_DUALCAST		= 1 << 2,
-	ACCEL_COMPARE		= 1 << 3,
-	ACCEL_CRC32C		= 1 << 4,
-	ACCEL_DIF		= 1 << 5,
-	ACCEL_COPY_CRC32C	= 1 << 6,
+enum accel_opcode {
+	ACCEL_OPC_COPY			= 0,
+	ACCEL_OPC_FILL			= 1,
+	ACCEL_OPC_DUALCAST		= 2,
+	ACCEL_OPC_COMPARE		= 3,
+	ACCEL_OPC_CRC32C		= 4,
+	ACCEL_OPC_COPY_CRC32C		= 5,
+	ACCEL_OPC_COMPRESS		= 6,
+	ACCEL_OPC_DECOMPRESS		= 7,
+	ACCEL_OPC_LAST			= 8,
 };
 
 /**
@@ -100,15 +102,6 @@ void spdk_accel_engine_module_finish(void);
  * \return a pointer to the I/O channel on success, or NULL on failure.
  */
 struct spdk_io_channel *spdk_accel_engine_get_io_channel(void);
-
-/**
- * Retrieve accel engine HW acceleration capabilities.
- *
- * \param ch I/O channel associated with this call.
- *
- * \return bitmap of HW acceleration capabilities defined by enum accel_capability.
- */
-uint64_t spdk_accel_get_capabilities(struct spdk_io_channel *ch);
 
 /**
  * Submit a copy request.
@@ -255,6 +248,48 @@ int spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst, struct
 				   uint32_t iovcnt, uint32_t *crc_dst, uint32_t seed,
 				   int flags, spdk_accel_completion_cb cb_fn, void *cb_arg);
 
+/**
+ * Build and submit a memory compress request.
+ *
+ * This function will build the compress descriptor and submit it.
+ *
+ * \param ch I/O channel associated with this call
+ * \param dst Destination to compress to.
+ * \param src Source to read from.
+ * \param nbytes_dst Length in bytes of output buffer.
+ * \param nbytes_src Length in bytes of input buffer.
+ * \param output_size The size of the compressed data
+ * \param flags Flags, optional flags that can vary per operation.
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param cb_arg Opaque value which will be passed back as the arg parameter in
+ * the completion callback.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_compress(struct spdk_io_channel *ch, void *dst, void *src,
+			       uint64_t nbytes_dst, uint64_t nbytes_src, uint32_t *output_size,
+			       int flags, spdk_accel_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Build and submit a memory decompress request.
+ *
+ * This function will build the decompress descriptor and submit it.
+ *
+ * \param ch I/O channel associated with this call
+ * \param dst Destination. Must be large enough to hold decompressed data.
+ * \param src Source to read from.
+ * \param nbytes_dst Length in bytes of output buffer.
+ * \param nbytes_src Length in bytes of input buffer.
+ * \param flags Flags, optional flags that can vary per operation.
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param cb_arg Opaque value which will be passed back as the arg parameter in
+ * the completion callback.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_decompress(struct spdk_io_channel *ch, void *dst, void *src,
+				 uint64_t nbytes_dst, uint64_t nbytes_src, int flags,
+				 spdk_accel_completion_cb cb_fn, void *cb_arg);
 
 struct spdk_json_write_ctx;
 

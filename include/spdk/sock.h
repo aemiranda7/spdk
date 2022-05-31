@@ -71,7 +71,13 @@ struct spdk_sock_request {
 	 */
 	struct __sock_request_internal {
 		TAILQ_ENTRY(spdk_sock_request)	link;
+#ifdef DEBUG
+		void				*curr_list;
+#endif
 		uint32_t			offset;
+
+		/* Indicate if the whole req or part of it is sent with zerocopy */
+		bool				is_zcopy;
 	} internal;
 
 	int				iovcnt;
@@ -128,14 +134,20 @@ struct spdk_sock_impl_opts {
 	uint32_t enable_placement_id;
 
 	/**
-	 * Enable or disable use of zero copy flow on send for server sockets. Used by posix socket module.
+	 * Enable or disable use of zero copy flow on send for server sockets. Used by posix and uring socket modules.
 	 */
 	bool enable_zerocopy_send_server;
 
 	/**
-	 * Enable or disable use of zero copy flow on send for client sockets. Used by posix socket module.
+	 * Enable or disable use of zero copy flow on send for client sockets. Used by posix and uring socket modules.
 	 */
 	bool enable_zerocopy_send_client;
+
+	/**
+	 * Set zerocopy threshold in bytes. A consecutive sequence of requests' iovecs that fall below this
+	 * threshold may be sent without zerocopy flag set.
+	 */
+	uint32_t zerocopy_threshold;
 };
 
 /**
@@ -161,6 +173,11 @@ struct spdk_sock_opts {
 	 * Used to enable or disable zero copy on socket layer.
 	 */
 	bool zcopy;
+
+	/**
+	 * Time in msec to wait ack until connection is closed forcefully.
+	 */
+	uint32_t ack_timeout;
 };
 
 /**
@@ -467,10 +484,12 @@ int spdk_sock_group_close(struct spdk_sock_group **group);
  *
  * \param sock The socket
  * \param group Returns the optimal sock group. If there is no optimal sock group, returns NULL.
+ * \param hint When return is 0 and group is set to NULL, hint is used to set optimal sock group for the socket.
  *
  * \return 0 on success. Negated errno on failure.
  */
-int spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group);
+int spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group,
+				     struct spdk_sock_group *hint);
 
 /**
  * Get current socket implementation options.

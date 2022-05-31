@@ -141,6 +141,10 @@ function linux_bind_driver() {
 
 	pci_dev_echo "$bdf" "$old_driver_name -> $driver_name"
 
+	if [[ $driver_name == "none" ]]; then
+		return 0
+	fi
+
 	echo "$ven_dev_id" > "/sys/bus/pci/drivers/$driver_name/new_id" 2> /dev/null || true
 	echo "$bdf" > "/sys/bus/pci/drivers/$driver_name/bind" 2> /dev/null || true
 
@@ -198,40 +202,63 @@ function get_block_dev_from_bdf() {
 	done
 }
 
-function get_mounted_part_dev_from_bdf_block() {
+function get_used_bdf_block_devs() {
 	local bdf=$1
-	local blocks block dev mount
+	local blocks block blockp dev mount holder
+	local used
 
 	hash lsblk || return 1
 	blocks=($(get_block_dev_from_bdf "$bdf"))
 
 	for block in "${blocks[@]}"; do
+		# Check if the device is hold by some other, regardless if it's mounted
+		# or not.
+		for holder in "/sys/class/block/$block"*/holders/*; do
+			[[ -e $holder ]] || continue
+			blockp=${holder%/holders*} blockp=${blockp##*/}
+			if [[ -e $holder/slaves/$blockp ]]; then
+				used+=("holder@$blockp:${holder##*/}")
+			fi
+		done
 		while read -r dev mount; do
 			if [[ -e $mount ]]; then
-				echo "$block:$dev"
+				used+=("mount@$block:$dev")
 			fi
 		done < <(lsblk -l -n -o NAME,MOUNTPOINT "/dev/$block")
+		if ((${#used[@]} == 0)); then
+			# Make sure we check if there's any valid data present on the target device
+			# regardless if it's being actively used or not. This is mainly done to make
+			# sure we don't miss more complex setups like ZFS pools, etc.
+			if block_in_use "$block" > /dev/null; then
+				used+=("data@$block")
+			fi
+		fi
 	done
+
+	if ((${#used[@]} > 0)); then
+		printf '%s\n' "${used[@]}"
+	fi
 }
 
 function collect_devices() {
-	# NVMe, IOAT, IDXD, VIRTIO, VMD
+	# NVMe, IOAT, DSA, IAA, VIRTIO, VMD
 
 	local ids dev_type dev_id bdf bdfs in_use driver
 
 	ids+="PCI_DEVICE_ID_INTEL_IOAT"
-	ids+="|PCI_DEVICE_ID_INTEL_IDXD"
+	ids+="|PCI_DEVICE_ID_INTEL_DSA"
+	ids+="|PCI_DEVICE_ID_INTEL_IAA"
 	ids+="|PCI_DEVICE_ID_VIRTIO"
 	ids+="|PCI_DEVICE_ID_INTEL_VMD"
 	ids+="|SPDK_PCI_CLASS_NVME"
 
-	local -gA nvme_d ioat_d idxd_d virtio_d vmd_d all_devices_d drivers_d
+	local -gA nvme_d ioat_d dsa_d iaa_d virtio_d vmd_d all_devices_d drivers_d
 
 	while read -r _ dev_type dev_id; do
 		bdfs=(${pci_bus_cache["0x8086:$dev_id"]})
 		[[ $dev_type == *NVME* ]] && bdfs=(${pci_bus_cache["$dev_id"]})
 		[[ $dev_type == *VIRT* ]] && bdfs=(${pci_bus_cache["0x1af4:$dev_id"]})
-		[[ $dev_type =~ (NVME|IOAT|IDXD|VIRTIO|VMD) ]] && dev_type=${BASH_REMATCH[1],,}
+		[[ $dev_type =~ (NVME|IOAT|DSA|IAA|VIRTIO|VMD) ]] && dev_type=${BASH_REMATCH[1],,}
 		for bdf in "${bdfs[@]}"; do
 			in_use=0
 			if [[ $1 != status ]]; then
@@ -240,7 +267,7 @@ function collect_devices() {
 					in_use=1
 				fi
 				if [[ $dev_type == nvme || $dev_type == virtio ]]; then
-					if ! verify_bdf_mounts "$bdf"; then
+					if ! verify_bdf_block_devs "$bdf"; then
 						in_use=1
 					fi
 				fi
@@ -248,6 +275,17 @@ function collect_devices() {
 					if [[ $PCI_ALLOWED != *"$bdf"* ]]; then
 						pci_dev_echo "$bdf" "Skipping not allowed VMD controller at $bdf"
 						in_use=1
+					elif [[ " ${drivers_d[*]} " =~ "nvme" ]]; then
+						if [[ "${DRIVER_OVERRIDE}" != "none" ]]; then
+							if [ "$mode" == "config" ]; then
+								cat <<- MESSAGE
+									Binding new driver to VMD device. If there are NVMe SSDs behind the VMD endpoint
+									which are attached to the kernel NVMe driver,the binding process may go faster
+									if you first run this script with DRIVER_OVERRIDE="none" to unbind only the
+									NVMe SSDs, and then run again to unbind the VMD devices."
+								MESSAGE
+							fi
+						fi
 					fi
 				fi
 			fi
@@ -273,21 +311,22 @@ function collect_driver() {
 	else
 		[[ -n ${nvme_d["$bdf"]} ]] && driver=nvme
 		[[ -n ${ioat_d["$bdf"]} ]] && driver=ioatdma
-		[[ -n ${idxd_d["$bdf"]} ]] && driver=idxd
+		[[ -n ${dsa_d["$bdf"]} ]] && driver=dsa
+		[[ -n ${iaa_d["$bdf"]} ]] && driver=iaa
 		[[ -n ${virtio_d["$bdf"]} ]] && driver=virtio-pci
 		[[ -n ${vmd_d["$bdf"]} ]] && driver=vmd
 	fi 2> /dev/null
 	echo "$driver"
 }
 
-function verify_bdf_mounts() {
+function verify_bdf_block_devs() {
 	local bdf=$1
 	local blknames
-	blknames=($(get_mounted_part_dev_from_bdf_block "$bdf")) || return 1
+	blknames=($(get_used_bdf_block_devs "$bdf")) || return 1
 
 	if ((${#blknames[@]} > 0)); then
 		local IFS=","
-		pci_dev_echo "$bdf" "Active mountpoints on ${blknames[*]}, so not binding PCI dev"
+		pci_dev_echo "$bdf" "Active devices: ${blknames[*]}, so not binding PCI dev"
 		return 1
 	fi
 }
@@ -305,7 +344,9 @@ function configure_linux_pci() {
 		fi
 	fi
 
-	if [[ -n "${DRIVER_OVERRIDE}" ]]; then
+	if [[ "${DRIVER_OVERRIDE}" == "none" ]]; then
+		driver_name=none
+	elif [[ -n "${DRIVER_OVERRIDE}" ]]; then
 		driver_path="$DRIVER_OVERRIDE"
 		driver_name="${DRIVER_OVERRIDE##*/}"
 		# modprobe and the sysfs don't use the .ko suffix.
@@ -337,10 +378,12 @@ function configure_linux_pci() {
 	fi
 
 	# modprobe assumes the directory of the module. If the user passes in a path, we should use insmod
-	if [[ -n "$driver_path" ]]; then
-		insmod $driver_path || true
-	else
-		modprobe $driver_name
+	if [[ $driver_name != "none" ]]; then
+		if [[ -n "$driver_path" ]]; then
+			insmod $driver_path || true
+		else
+			modprobe $driver_name
+		fi
 	fi
 
 	for bdf in "${!all_devices_d[@]}"; do
@@ -527,11 +570,11 @@ function configure_linux() {
 		fi
 	fi
 
-	if [ ! -e /dev/cpu/0/msr ]; then
+	if [ $(uname -i) == "x86_64" ] && [ ! -e /dev/cpu/0/msr ]; then
 		# Some distros build msr as a module.  Make sure it's loaded to ensure
 		#  DPDK can easily figure out the TSC rate rather than relying on 100ms
 		#  sleeps.
-		modprobe msr || true
+		modprobe msr &> /dev/null || true
 	fi
 }
 
@@ -626,7 +669,8 @@ function status_linux() {
 		desc=""
 		desc=${desc:-${nvme_d["$bdf"]:+NVMe}}
 		desc=${desc:-${ioat_d["$bdf"]:+I/OAT}}
-		desc=${desc:-${idxd_d["$bdf"]:+IDXD}}
+		desc=${desc:-${dsa_d["$bdf"]:+DSA}}
+		desc=${desc:-${iaa_d["$bdf"]:+IAA}}
 		desc=${desc:-${virtio_d["$bdf"]:+virtio}}
 		desc=${desc:-${vmd_d["$bdf"]:+VMD}}
 
@@ -680,8 +724,11 @@ function status_freebsd() {
 		I/IOAT DMA
 		$(status_print "${!ioat_d[@]}")
 
-		IDXD DMA
-		$(status_print "${!idxd_d[@]}")
+		DSA DMA
+		$(status_print "${!dsa_d[@]}")
+
+		IAA DMA
+		$(status_print "${!iaa_d[@]}")
 
 		VMD
 		$(status_print "${!vmd_d[@]}")
@@ -693,7 +740,8 @@ function configure_freebsd_pci() {
 
 	BDFS+=("${!nvme_d[@]}")
 	BDFS+=("${!ioat_d[@]}")
-	BDFS+=("${!idxd_d[@]}")
+	BDFS+=("${!dsa_d[@]}")
+	BDFS+=("${!iaa_d[@]}")
 	BDFS+=("${!vmd_d[@]}")
 
 	# Drop the domain part from all the addresses

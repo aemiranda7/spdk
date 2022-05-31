@@ -55,11 +55,6 @@ function load_ib_rdma_modules() {
 	modprobe rdma_ucm
 }
 
-function detect_soft_roce_nics() {
-	rxe_cfg stop # make sure we run tests with a clean slate
-	rxe_cfg start
-}
-
 function allocate_nic_ips() {
 	((count = NVMF_IP_LEAST_ADDR))
 	for nic_name in $(get_rdma_if_list); do
@@ -86,9 +81,7 @@ function get_rdma_if_list() {
 	mapfile -t rxe_net_devs < <(rxe_cfg rxe-net)
 
 	if ((${#net_devs[@]} == 0)); then
-		# No rdma-capable nics on board, using soft-RoCE
-		printf '%s\n' "${rxe_net_devs[@]}"
-		return 0
+		return 1
 	fi
 
 	# Pick only these devices which were found during gather_supported_nvmf_pci_devs() run
@@ -371,7 +364,7 @@ prepare_net_devs() {
 
 	remove_spdk_ns
 
-	[[ $NET_TYPE == virt ]] || gather_supported_nvmf_pci_devs && is_hw=yes
+	[[ $NET_TYPE != virt ]] && gather_supported_nvmf_pci_devs && is_hw=yes
 
 	if [[ $is_hw == yes ]]; then
 		if [[ $TEST_TRANSPORT == tcp ]]; then
@@ -388,12 +381,13 @@ prepare_net_devs() {
 	fi
 
 	# NET_TYPE == virt or phy-fallback
-	if [[ $TEST_TRANSPORT == rdma ]]; then
-		detect_soft_roce_nics
-	elif [[ $TEST_TRANSPORT == tcp ]]; then
+	if [[ $TEST_TRANSPORT == tcp ]]; then
 		nvmf_veth_init
+		return 0
 	fi
 
+	echo "ERROR: virt and fallback setup is not supported for $TEST_TRANSPORT"
+	return 1
 }
 
 function nvmftestinit() {
@@ -402,7 +396,7 @@ function nvmftestinit() {
 		return 1
 	fi
 
-	trap 'process_shm --id $NVMF_APP_SHM_ID || :; nvmftestfini' SIGINT SIGTERM EXIT
+	trap 'nvmftestfini' SIGINT SIGTERM EXIT
 
 	prepare_net_devs
 
@@ -417,7 +411,7 @@ function nvmftestinit() {
 		NVMF_SECOND_TARGET_IP=$(echo "$RDMA_IP_LIST" | tail -n +2 | head -n 1)
 		if [ -z $NVMF_FIRST_TARGET_IP ]; then
 			echo "no RDMA NIC for nvmf test"
-			exit 0
+			exit 1
 		fi
 	elif [[ "$TEST_TRANSPORT" == "tcp" ]]; then
 		NVMF_TRANSPORT_OPTS="$NVMF_TRANSPORT_OPTS -o"
@@ -439,6 +433,7 @@ function nvmfappstart() {
 	nvmfpid=$!
 	waitforlisten $nvmfpid
 	timing_exit start_nvmf_tgt
+	trap 'process_shm --id $NVMF_APP_SHM_ID || :; nvmftestfini' SIGINT SIGTERM EXIT
 }
 
 function nvmftestfini() {
@@ -457,17 +452,6 @@ function nvmftestfini() {
 function rdma_device_init() {
 	load_ib_rdma_modules
 	allocate_nic_ips
-}
-
-function revert_soft_roce() {
-	rxe_cfg stop
-}
-
-function check_ip_is_soft_roce() {
-	if [ "$TEST_TRANSPORT" != "rdma" ]; then
-		return 0
-	fi
-	rxe_cfg status rxe | grep -wq "$1"
 }
 
 function nvme_connect() {

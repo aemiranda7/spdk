@@ -126,10 +126,17 @@ ioat_poll(void *arg)
 
 static struct spdk_io_channel *ioat_get_io_channel(void);
 
-static uint64_t
-ioat_get_capabilities(void)
+static bool
+ioat_supports_opcode(enum accel_opcode opc)
 {
-	return ACCEL_COPY | ACCEL_FILL;
+	switch (opc) {
+	case ACCEL_OPC_COPY:
+	case ACCEL_OPC_FILL:
+		return true;
+	default:
+		return false;
+	}
+
 }
 
 static int
@@ -146,11 +153,11 @@ ioat_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *accel_task
 
 	do {
 		switch (accel_task->op_code) {
-		case ACCEL_OPCODE_MEMFILL:
+		case ACCEL_OPC_FILL:
 			rc = spdk_ioat_build_fill(ioat_ch->ioat_ch, accel_task, ioat_done,
 						  accel_task->dst, accel_task->fill_pattern, accel_task->nbytes);
 			break;
-		case ACCEL_OPCODE_MEMMOVE:
+		case ACCEL_OPC_COPY:
 			rc = spdk_ioat_build_copy(ioat_ch->ioat_ch, accel_task, ioat_done,
 						  accel_task->dst, accel_task->src, accel_task->nbytes);
 			break;
@@ -175,7 +182,8 @@ ioat_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *accel_task
 }
 
 static struct spdk_accel_engine ioat_accel_engine = {
-	.get_capabilities	= ioat_get_capabilities,
+	.name			= "ioat",
+	.supports_opcode	= ioat_supports_opcode,
 	.get_io_channel		= ioat_get_io_channel,
 	.submit_tasks		= ioat_submit_tasks,
 };
@@ -282,28 +290,23 @@ accel_engine_ioat_init(void)
 	}
 
 	g_ioat_initialized = true;
-	SPDK_NOTICELOG("Accel engine updated to use IOAT engine.\n");
-	spdk_accel_hw_engine_register(&ioat_accel_engine);
+	SPDK_NOTICELOG("Accel framework IOAT engine initialized.\n");
+	spdk_accel_engine_register(&ioat_accel_engine);
 	spdk_io_device_register(&ioat_accel_engine, ioat_create_cb, ioat_destroy_cb,
 				sizeof(struct ioat_io_channel), "ioat_accel_engine");
 	return 0;
 }
 
 static void
-accel_engine_ioat_exit(void *ctx)
+_device_unregister_cb(void *io_device)
 {
-	struct ioat_device *dev;
+	struct ioat_device *dev = io_device;
 	struct pci_device *pci_dev;
-
-	if (g_ioat_initialized) {
-		spdk_io_device_unregister(&ioat_accel_engine, NULL);
-	}
 
 	while (!TAILQ_EMPTY(&g_devices)) {
 		dev = TAILQ_FIRST(&g_devices);
 		TAILQ_REMOVE(&g_devices, dev, tailq);
 		spdk_ioat_detach(dev->ioat);
-		ioat_free_device(dev);
 		free(dev);
 	}
 
@@ -315,6 +318,16 @@ accel_engine_ioat_exit(void *ctx)
 	}
 
 	spdk_accel_engine_module_finish();
+}
+
+static void
+accel_engine_ioat_exit(void *ctx)
+{
+	if (g_ioat_initialized) {
+		spdk_io_device_unregister(&ioat_accel_engine, _device_unregister_cb);
+	} else {
+		spdk_accel_engine_module_finish();
+	}
 }
 
 SPDK_LOG_REGISTER_COMPONENT(accel_ioat)

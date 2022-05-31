@@ -69,6 +69,11 @@ static inline void movdir64b(void *dst, const void *src)
 #define WQ_PRIORITY_1		1
 #define IDXD_MAX_QUEUES		64
 
+enum idxd_dev {
+	IDXD_DEV_TYPE_DSA	= 0,
+	IDXD_DEV_TYPE_IAA	= 1,
+};
+
 /* Each pre-allocated batch structure goes on a per channel list and
  * contains the memory for both user descriptors.
  */
@@ -77,8 +82,8 @@ struct idxd_batch {
 	struct idxd_ops			*user_ops;
 	uint64_t			user_desc_addr;
 	uint8_t				index;
+	uint8_t				refcnt;
 	struct spdk_idxd_io_channel	*chan;
-	bool				transparent;
 	TAILQ_ENTRY(idxd_batch)		link;
 };
 
@@ -105,9 +110,9 @@ struct spdk_idxd_io_channel {
 	 * data descriptors and are located in the batch structure.
 	 */
 	void					*desc_base;
-	TAILQ_HEAD(, idxd_ops)			ops_pool;
+	STAILQ_HEAD(, idxd_ops)			ops_pool;
 	/* Current list of outstanding operations to poll. */
-	TAILQ_HEAD(op_head, idxd_ops)		ops_outstanding;
+	STAILQ_HEAD(op_head, idxd_ops)		ops_outstanding;
 	void					*ops_base;
 
 	TAILQ_HEAD(, idxd_batch)		batch_pool;
@@ -119,46 +124,33 @@ struct pci_dev_id {
 	int device_id;
 };
 
-struct idxd_group {
-	struct spdk_idxd_device	*idxd;
-	struct idxd_grpcfg	grpcfg;
-	struct pci_dev_id	pcidev;
-	int			num_engines;
-	int			num_wqs;
-	int			id;
-	uint8_t			tokens_allowed;
-	bool			use_token_limit;
-	uint8_t			tokens_reserved;
-	int			tc_a;
-	int			tc_b;
-};
-
 /*
  * This struct wraps the hardware completion record which is 32 bytes in
  * size and must be 32 byte aligned.
  */
 struct idxd_ops {
-	struct idxd_hw_comp_record	hw;
+	union {
+		struct dsa_hw_comp_record	hw;
+		struct iaa_hw_comp_record	iaa_hw;
+	};
 	void				*cb_arg;
 	spdk_idxd_req_cb		cb_fn;
 	struct idxd_batch		*batch;
 	struct idxd_hw_desc		*desc;
-	uint32_t			*crc_dst;
-	char				pad[8];
-	TAILQ_ENTRY(idxd_ops)		link;
+	union {
+		uint32_t		*crc_dst;
+		uint32_t		*output_size;
+	};
+	struct idxd_ops			*parent;
+	uint32_t			count;
+	STAILQ_ENTRY(idxd_ops)		link;
 };
-SPDK_STATIC_ASSERT(sizeof(struct idxd_ops) == 96, "size mismatch");
-
-struct idxd_wq {
-	struct spdk_idxd_device		*idxd;
-	struct idxd_group		*group;
-	union idxd_wqcfg		wqcfg;
-};
+SPDK_STATIC_ASSERT(sizeof(struct idxd_ops) == 128, "size mismatch");
 
 struct spdk_idxd_impl {
 	const char *name;
-	void (*set_config)(struct device_config *g_dev_cfg, uint32_t config_num);
-	int (*probe)(void *cb_ctx, spdk_idxd_attach_cb attach_cb);
+	int (*probe)(void *cb_ctx, spdk_idxd_attach_cb attach_cb,
+		     spdk_idxd_probe_cb probe_cb);
 	void (*destruct)(struct spdk_idxd_device *idxd);
 	void (*dump_sw_error)(struct spdk_idxd_device *idxd, void *portal);
 	char *(*portal_get_addr)(struct spdk_idxd_device *idxd);
@@ -168,16 +160,14 @@ struct spdk_idxd_impl {
 
 struct spdk_idxd_device {
 	struct spdk_idxd_impl		*impl;
-	void				*portals;
-	uint32_t                        socket_id;
-	int				wq_id;
+	void				*portal;
+	uint32_t			socket_id;
 	uint32_t			num_channels;
 	uint32_t			total_wq_size;
 	uint32_t			chan_per_device;
 	pthread_mutex_t			num_channels_lock;
-
-	struct idxd_group		*groups;
-	struct idxd_wq			*queues;
+	enum idxd_dev			type;
+	struct iaa_aecs			*aecs;
 };
 
 void idxd_impl_register(struct spdk_idxd_impl *impl);

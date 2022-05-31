@@ -93,7 +93,6 @@ invalid:
 }
 SPDK_RPC_REGISTER("vhost_create_scsi_controller", rpc_vhost_create_scsi_controller,
 		  SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_create_scsi_controller, construct_vhost_scsi_controller)
 
 struct rpc_vhost_scsi_ctrlr_add_target {
 	char *ctrlr;
@@ -159,7 +158,6 @@ invalid:
 }
 SPDK_RPC_REGISTER("vhost_scsi_controller_add_target", rpc_vhost_scsi_controller_add_target,
 		  SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_scsi_controller_add_target, add_vhost_scsi_lun)
 
 struct rpc_remove_vhost_scsi_ctrlr_target {
 	char *ctrlr;
@@ -229,24 +227,19 @@ invalid:
 
 SPDK_RPC_REGISTER("vhost_scsi_controller_remove_target",
 		  rpc_vhost_scsi_controller_remove_target, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_scsi_controller_remove_target, remove_vhost_scsi_target)
 
 struct rpc_vhost_blk_ctrlr {
 	char *ctrlr;
 	char *dev_name;
 	char *cpumask;
-	bool readonly;
-	bool packed_ring;
-	bool packed_ring_recovery;
+	char *transport;
 };
 
 static const struct spdk_json_object_decoder rpc_construct_vhost_blk_ctrlr[] = {
 	{"ctrlr", offsetof(struct rpc_vhost_blk_ctrlr, ctrlr), spdk_json_decode_string },
 	{"dev_name", offsetof(struct rpc_vhost_blk_ctrlr, dev_name), spdk_json_decode_string },
 	{"cpumask", offsetof(struct rpc_vhost_blk_ctrlr, cpumask), spdk_json_decode_string, true},
-	{"readonly", offsetof(struct rpc_vhost_blk_ctrlr, readonly), spdk_json_decode_bool, true},
-	{"packed_ring", offsetof(struct rpc_vhost_blk_ctrlr, packed_ring), spdk_json_decode_bool, true},
-	{"packed_ring_recovery", offsetof(struct rpc_vhost_blk_ctrlr, packed_ring_recovery), spdk_json_decode_bool, true},
+	{"transport", offsetof(struct rpc_vhost_blk_ctrlr, transport), spdk_json_decode_string, true},
 };
 
 static void
@@ -255,6 +248,7 @@ free_rpc_vhost_blk_ctrlr(struct rpc_vhost_blk_ctrlr *req)
 	free(req->ctrlr);
 	free(req->dev_name);
 	free(req->cpumask);
+	free(req->transport);
 }
 
 static void
@@ -264,18 +258,15 @@ rpc_vhost_create_blk_controller(struct spdk_jsonrpc_request *request,
 	struct rpc_vhost_blk_ctrlr req = {0};
 	int rc;
 
-	if (spdk_json_decode_object(params, rpc_construct_vhost_blk_ctrlr,
-				    SPDK_COUNTOF(rpc_construct_vhost_blk_ctrlr),
-				    &req)) {
+	if (spdk_json_decode_object_relaxed(params, rpc_construct_vhost_blk_ctrlr,
+					    SPDK_COUNTOF(rpc_construct_vhost_blk_ctrlr),
+					    &req)) {
 		SPDK_DEBUGLOG(vhost_rpc, "spdk_json_decode_object failed\n");
 		rc = -EINVAL;
 		goto invalid;
 	}
 
-	g_packed_ring_recovery = req.packed_ring_recovery;
-
-	rc = spdk_vhost_blk_construct(req.ctrlr, req.cpumask, req.dev_name,
-				      req.readonly, req.packed_ring);
+	rc = spdk_vhost_blk_construct(req.ctrlr, req.cpumask, req.dev_name, req.transport, params);
 	if (rc < 0) {
 		goto invalid;
 	}
@@ -293,7 +284,6 @@ invalid:
 }
 SPDK_RPC_REGISTER("vhost_create_blk_controller", rpc_vhost_create_blk_controller,
 		  SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_create_blk_controller, construct_vhost_blk_controller)
 
 struct rpc_delete_vhost_ctrlr {
 	char *ctrlr;
@@ -350,7 +340,6 @@ invalid:
 
 }
 SPDK_RPC_REGISTER("vhost_delete_controller", rpc_vhost_delete_controller, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_delete_controller, remove_vhost_controller)
 
 struct rpc_get_vhost_ctrlrs {
 	char *name;
@@ -449,7 +438,6 @@ invalid:
 					 spdk_strerror(-rc));
 }
 SPDK_RPC_REGISTER("vhost_get_controllers", rpc_vhost_get_controllers, SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_get_controllers, get_vhost_controllers)
 
 
 struct rpc_vhost_ctrlr_coalescing {
@@ -511,6 +499,52 @@ invalid:
 }
 SPDK_RPC_REGISTER("vhost_controller_set_coalescing", rpc_vhost_controller_set_coalescing,
 		  SPDK_RPC_RUNTIME)
-SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_controller_set_coalescing, set_vhost_controller_coalescing)
+
+struct rpc_virtio_blk_create_transport {
+	char *name;
+};
+
+static const struct spdk_json_object_decoder rpc_create_virtio_blk_transport[] = {
+	{"name", offsetof(struct rpc_virtio_blk_create_transport, name), spdk_json_decode_string},
+};
+
+static void
+free_rpc_virtio_blk_create_transport(struct rpc_virtio_blk_create_transport *req)
+{
+	free(req->name);
+}
+
+static void
+rpc_virtio_blk_create_transport(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_virtio_blk_create_transport req = {0};
+	int rc;
+
+	if (spdk_json_decode_object_relaxed(params, rpc_create_virtio_blk_transport,
+					    SPDK_COUNTOF(rpc_create_virtio_blk_transport), &req)) {
+		SPDK_DEBUGLOG(vhost_rpc, "spdk_json_decode_object failed\n");
+		rc = -EINVAL;
+		goto invalid;
+	}
+
+	spdk_vhost_lock();
+	rc = virtio_blk_transport_create(req.name, params);
+	spdk_vhost_unlock();
+	if (rc != 0) {
+		goto invalid;
+	}
+
+	free_rpc_virtio_blk_create_transport(&req);
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	free_rpc_virtio_blk_create_transport(&req);
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-rc));
+}
+SPDK_RPC_REGISTER("virtio_blk_create_transport", rpc_virtio_blk_create_transport,
+		  SPDK_RPC_RUNTIME)
 
 SPDK_LOG_REGISTER_COMPONENT(vhost_rpc)

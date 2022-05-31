@@ -54,6 +54,7 @@ extern "C" {
 #define SPDK_PCI_VID_VMWARE		0x15ad
 #define SPDK_PCI_VID_REDHAT		0x1b36
 #define SPDK_PCI_VID_NUTANIX		0x4e58
+#define SPDK_PCI_VID_HUAWEI		0x19e5
 
 #define SPDK_PCI_CLASS_ANY_ID		0xffffff
 /**
@@ -65,7 +66,8 @@ extern "C" {
  */
 #define SPDK_PCI_CLASS_NVME		0x010802
 
-#define PCI_DEVICE_ID_INTEL_IDXD	0x0b25
+#define PCI_DEVICE_ID_INTEL_DSA		0x0b25
+#define PCI_DEVICE_ID_INTEL_IAA		0x0cfe
 
 #define PCI_DEVICE_ID_INTEL_IOAT_SNB0	0x3c20
 #define PCI_DEVICE_ID_INTEL_IOAT_SNB1	0x3c21

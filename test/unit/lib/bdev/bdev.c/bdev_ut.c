@@ -45,11 +45,44 @@
 
 DEFINE_STUB(spdk_notify_send, uint64_t, (const char *type, const char *ctx), 0);
 DEFINE_STUB(spdk_notify_type_register, struct spdk_notify_type *, (const char *type), NULL);
+DEFINE_STUB(spdk_memory_domain_get_dma_device_id, const char *, (struct spdk_memory_domain *domain),
+	    "test_domain");
+DEFINE_STUB(spdk_memory_domain_get_dma_device_type, enum spdk_dma_device_type,
+	    (struct spdk_memory_domain *domain), 0);
+
+static bool g_memory_domain_pull_data_called;
+static bool g_memory_domain_push_data_called;
+
+DEFINE_RETURN_MOCK(spdk_memory_domain_pull_data, int);
+int
+spdk_memory_domain_pull_data(struct spdk_memory_domain *src_domain, void *src_domain_ctx,
+			     struct iovec *src_iov, uint32_t src_iov_cnt, struct iovec *dst_iov, uint32_t dst_iov_cnt,
+			     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
+{
+	g_memory_domain_pull_data_called = true;
+	HANDLE_RETURN_MOCK(spdk_memory_domain_pull_data);
+	cpl_cb(cpl_cb_arg, 0);
+	return 0;
+}
+
+DEFINE_RETURN_MOCK(spdk_memory_domain_push_data, int);
+int
+spdk_memory_domain_push_data(struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
+			     struct iovec *dst_iov, uint32_t dst_iovcnt, struct iovec *src_iov, uint32_t src_iovcnt,
+			     spdk_memory_domain_data_cpl_cb cpl_cb, void *cpl_cb_arg)
+{
+	g_memory_domain_push_data_called = true;
+	HANDLE_RETURN_MOCK(spdk_memory_domain_push_data);
+	cpl_cb(cpl_cb_arg, 0);
+	return 0;
+}
 
 int g_status;
 int g_count;
 enum spdk_bdev_event_type g_event_type1;
 enum spdk_bdev_event_type g_event_type2;
+enum spdk_bdev_event_type g_event_type3;
+enum spdk_bdev_event_type g_event_type4;
 struct spdk_histogram_data *g_histogram;
 void *g_unregister_arg;
 int g_unregister_rc;
@@ -238,6 +271,9 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 
 	if (expected_io->md_buf != NULL) {
 		CU_ASSERT(expected_io->md_buf == bdev_io->u.bdev.md_buf);
+		if (bdev_io->u.bdev.ext_opts) {
+			CU_ASSERT(expected_io->md_buf == bdev_io->u.bdev.ext_opts->metadata);
+		}
 	}
 
 	if (expected_io->length == 0) {
@@ -256,8 +292,12 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 
 	CU_ASSERT(expected_io->iovcnt == bdev_io->u.bdev.iovcnt);
 	for (i = 0; i < expected_io->iovcnt; i++) {
-		iov = &bdev_io->u.bdev.iovs[i];
 		expected_iov = &expected_io->iov[i];
+		if (bdev_io->internal.orig_iovcnt == 0) {
+			iov = &bdev_io->u.bdev.iovs[i];
+		} else {
+			iov = bdev_io->internal.orig_iovs;
+		}
 		CU_ASSERT(iov->iov_len == expected_iov->iov_len);
 		CU_ASSERT(iov->iov_base == expected_iov->iov_base);
 	}
@@ -528,6 +568,18 @@ bdev_open_cb2(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *even
 	if (SPDK_BDEV_EVENT_REMOVE == type) {
 		spdk_bdev_close(desc);
 	}
+}
+
+static void
+bdev_open_cb3(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+	g_event_type3 = type;
+}
+
+static void
+bdev_open_cb4(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+	g_event_type4 = type;
 }
 
 static void
@@ -3732,6 +3784,8 @@ bdev_open_while_hotremove(void)
 	CU_ASSERT(bdev == spdk_bdev_desc_get_bdev(desc[0]));
 
 	spdk_bdev_unregister(bdev, NULL, NULL);
+	/* Bdev unregister is handled asynchronously. Poll thread to complete. */
+	poll_threads();
 
 	rc = spdk_bdev_open_ext("bdev", false, bdev_ut_event_cb, NULL, &desc[1]);
 	CU_ASSERT(rc == -ENODEV);
@@ -3807,6 +3861,87 @@ bdev_open_ext(void)
 	/* Check if correct events have been triggered in event callback fn */
 	CU_ASSERT_EQUAL(g_event_type1, SPDK_BDEV_EVENT_REMOVE);
 	CU_ASSERT_EQUAL(g_event_type2, SPDK_BDEV_EVENT_REMOVE);
+
+	free_bdev(bdev);
+	poll_threads();
+}
+
+static void
+bdev_open_ext_unregister(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc1 = NULL;
+	struct spdk_bdev_desc *desc2 = NULL;
+	struct spdk_bdev_desc *desc3 = NULL;
+	struct spdk_bdev_desc *desc4 = NULL;
+	int rc = 0;
+
+	bdev = allocate_bdev("bdev");
+
+	rc = spdk_bdev_open_ext("bdev", true, NULL, NULL, &desc1);
+	CU_ASSERT_EQUAL(rc, -EINVAL);
+
+	rc = spdk_bdev_open_ext("bdev", true, bdev_open_cb1, &desc1, &desc1);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_bdev_open_ext("bdev", true, bdev_open_cb2, &desc2, &desc2);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_bdev_open_ext("bdev", true, bdev_open_cb3, &desc3, &desc3);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_bdev_open_ext("bdev", true, bdev_open_cb4, &desc4, &desc4);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	g_event_type1 = 0xFF;
+	g_event_type2 = 0xFF;
+	g_event_type3 = 0xFF;
+	g_event_type4 = 0xFF;
+
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	/* Simulate hot-unplug by unregistering bdev */
+	spdk_bdev_unregister(bdev, bdev_unregister_cb, (void *)0x12345678);
+
+	/*
+	 * Unregister is handled asynchronously and event callback
+	 * (i.e., above bdev_open_cbN) will be called.
+	 * For bdev_open_cb3 and bdev_open_cb4, it is intended to not
+	 * close the desc3 and desc4 so that the bdev is not closed.
+	 */
+	poll_threads();
+
+	/* Check if correct events have been triggered in event callback fn */
+	CU_ASSERT_EQUAL(g_event_type1, SPDK_BDEV_EVENT_REMOVE);
+	CU_ASSERT_EQUAL(g_event_type2, SPDK_BDEV_EVENT_REMOVE);
+	CU_ASSERT_EQUAL(g_event_type3, SPDK_BDEV_EVENT_REMOVE);
+	CU_ASSERT_EQUAL(g_event_type4, SPDK_BDEV_EVENT_REMOVE);
+
+	/* Check that unregister callback is delayed */
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	/*
+	 * Explicitly close desc3. As desc4 is still opened there, the
+	 * unergister callback is still delayed to execute.
+	 */
+	spdk_bdev_close(desc3);
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	/*
+	 * Explicitly close desc4 to trigger the ongoing bdev unregister
+	 * operation after last desc is closed.
+	 */
+	spdk_bdev_close(desc4);
+
+	/* Poll the thread for the async unregister operation */
+	poll_threads();
+
+	/* Check that unregister callback is executed */
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
 
 	free_bdev(bdev);
 	poll_threads();
@@ -4893,10 +5028,12 @@ bdev_writev_readv_ext(void)
 	struct spdk_bdev *bdev;
 	struct spdk_bdev_desc *desc = NULL;
 	struct spdk_io_channel *io_ch;
-	struct iovec iov = { .iov_base = (void *)0xbaaddead, .iov_len = 0x1000 };
+	char io_buf[512];
+	struct iovec iov = { .iov_base = io_buf, .iov_len = 512 };
 	struct ut_expected_io *expected_io;
 	struct spdk_bdev_ext_io_opts ext_io_opts = {
-		.metadata = (void *)0xFF000000
+		.metadata = (void *)0xFF000000,
+		.size = sizeof(ext_io_opts)
 	};
 	int rc;
 
@@ -4913,6 +5050,7 @@ bdev_writev_readv_ext(void)
 	io_ch = spdk_bdev_get_io_channel(desc);
 	CU_ASSERT(io_ch != NULL);
 
+	/* Test 1, Simple test */
 	g_io_done = false;
 	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, 32, 14, 1);
 	expected_io->md_buf = ext_io_opts.metadata;
@@ -4938,6 +5076,118 @@ bdev_writev_readv_ext(void)
 	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
 
 	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_io_done == false);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 1);
+	stub_complete_io(1);
+	CU_ASSERT(g_io_done == true);
+
+	/* Test 2, invalid ext_opts size */
+	ext_io_opts.size = 0;
+	rc = spdk_bdev_readv_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+
+	ext_io_opts.size = sizeof(ext_io_opts) * 2;
+	rc = spdk_bdev_readv_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+
+	ext_io_opts.size = offsetof(struct spdk_bdev_ext_io_opts, metadata) +
+			   sizeof(ext_io_opts.metadata) - 1;
+	rc = spdk_bdev_readv_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc != 0);
+
+	/* Test 3, Check that IO request with ext_opts and metadata is split correctly
+	 * Offset 14, length 8, payload 0xF000
+	 *  Child - Offset 14, length 2, payload 0xF000
+	 *  Child - Offset 16, length 6, payload 0xF000 + 2 * 512
+	 */
+	bdev->optimal_io_boundary = 16;
+	bdev->split_on_optimal_io_boundary = true;
+	bdev->md_interleave = false;
+	bdev->md_len = 8;
+
+	iov.iov_base = (void *)0xF000;
+	iov.iov_len = 4096;
+	memset(&ext_io_opts, 0, sizeof(ext_io_opts));
+	ext_io_opts.metadata = (void *)0xFF000000;
+	ext_io_opts.size = sizeof(ext_io_opts);
+	g_io_done = false;
+
+	/* read */
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, 14, 2, 1);
+	expected_io->md_buf = ext_io_opts.metadata;
+	ut_expected_io_set_iov(expected_io, 0, (void *)0xF000, 2 * 512);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, 16, 6, 1);
+	expected_io->md_buf = ext_io_opts.metadata + 2 * 8;
+	ut_expected_io_set_iov(expected_io, 0, (void *)(0xF000 + 2 * 512), 6 * 512);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	rc = spdk_bdev_readv_blocks_ext(desc, io_ch, &iov, 1, 14, 8, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_io_done == false);
+
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 2);
+	stub_complete_io(2);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 0);
+
+	/* write */
+	g_io_done = false;
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_WRITE, 14, 2, 1);
+	expected_io->md_buf = ext_io_opts.metadata;
+	ut_expected_io_set_iov(expected_io, 0, (void *)0xF000, 2 * 512);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_WRITE, 16, 6, 1);
+	expected_io->md_buf = ext_io_opts.metadata + 2 * 8;
+	ut_expected_io_set_iov(expected_io, 0, (void *)(0xF000 + 2 * 512), 6 * 512);
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 14, 8, io_done, NULL, &ext_io_opts);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_io_done == false);
+
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 2);
+	stub_complete_io(2);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 0);
+
+	/* Test 4, Verify data pull/push
+	 * bdev doens't support memory domains, so buffers from bdev memory pool will be used */
+	ext_io_opts.memory_domain = (struct spdk_memory_domain *)0xdeadbeef;
+
+	g_io_done = false;
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_READ, 32, 14, 1);
+	ut_expected_io_set_iov(expected_io, 0, iov.iov_base, iov.iov_len);
+	expected_io->ext_io_opts = &ext_io_opts;
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	rc = spdk_bdev_readv_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_io_done == false);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 1);
+	stub_complete_io(1);
+	CU_ASSERT(g_memory_domain_push_data_called == true);
+	CU_ASSERT(g_io_done == true);
+
+	g_io_done = false;
+	expected_io = ut_alloc_expected_io(SPDK_BDEV_IO_TYPE_WRITE, 32, 14, 1);
+	ut_expected_io_set_iov(expected_io, 0, iov.iov_base, iov.iov_len);
+	expected_io->ext_io_opts = &ext_io_opts;
+	TAILQ_INSERT_TAIL(&g_bdev_ut_channel->expected_io, expected_io, link);
+
+	rc = spdk_bdev_writev_blocks_ext(desc, io_ch, &iov, 1, 32, 14, io_done, NULL, &ext_io_opts);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_memory_domain_pull_data_called == true);
 	CU_ASSERT(g_io_done == false);
 	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 1);
 	stub_complete_io(1);
@@ -5017,6 +5267,100 @@ bdev_register_uuid_alias(void)
 	poll_threads();
 }
 
+static void
+bdev_unregister_by_name(void)
+{
+	struct spdk_bdev *bdev;
+	int rc;
+
+	bdev = allocate_bdev("bdev");
+
+	g_event_type1 = 0xFF;
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	rc = spdk_bdev_unregister_by_name("bdev1", &bdev_ut_if, bdev_unregister_cb, (void *)0x12345678);
+	CU_ASSERT(rc == -ENODEV);
+
+	rc = spdk_bdev_unregister_by_name("bdev", &vbdev_ut_if, bdev_unregister_cb, (void *)0x12345678);
+	CU_ASSERT(rc == -ENODEV);
+
+	rc = spdk_bdev_unregister_by_name("bdev", &bdev_ut_if, bdev_unregister_cb, (void *)0x12345678);
+	CU_ASSERT(rc == 0);
+
+	/* Check that unregister callback is delayed */
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	poll_threads();
+
+	/* Event callback shall not be issued because device was closed */
+	CU_ASSERT(g_event_type1 == 0xFF);
+	/* Unregister callback is issued */
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
+
+	free_bdev(bdev);
+}
+
+static int
+count_bdevs(void *ctx, struct spdk_bdev *bdev)
+{
+	int *count = ctx;
+
+	(*count)++;
+
+	return 0;
+}
+
+static void
+for_each_bdev_test(void)
+{
+	struct spdk_bdev *bdev[8];
+	int rc, count;
+
+	bdev[0] = allocate_bdev("bdev0");
+
+	bdev[1] = allocate_bdev("bdev1");
+	rc = spdk_bdev_module_claim_bdev(bdev[1], NULL, &bdev_ut_if);
+	CU_ASSERT(rc == 0);
+
+	bdev[2] = allocate_bdev("bdev2");
+
+	bdev[3] = allocate_bdev("bdev3");
+	rc = spdk_bdev_module_claim_bdev(bdev[3], NULL, &bdev_ut_if);
+	CU_ASSERT(rc == 0);
+
+	bdev[4] = allocate_bdev("bdev4");
+
+	bdev[5] = allocate_bdev("bdev5");
+	rc = spdk_bdev_module_claim_bdev(bdev[5], NULL, &bdev_ut_if);
+	CU_ASSERT(rc == 0);
+
+	bdev[6] = allocate_bdev("bdev6");
+
+	bdev[7] = allocate_bdev("bdev7");
+
+	count = 0;
+	rc = spdk_for_each_bdev(&count, count_bdevs);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(count == 8);
+
+	count = 0;
+	rc = spdk_for_each_bdev_leaf(&count, count_bdevs);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(count == 5);
+
+	free_bdev(bdev[0]);
+	free_bdev(bdev[1]);
+	free_bdev(bdev[2]);
+	free_bdev(bdev[3]);
+	free_bdev(bdev[4]);
+	free_bdev(bdev[5]);
+	free_bdev(bdev[6]);
+	free_bdev(bdev[7]);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5053,6 +5397,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_open_while_hotremove);
 	CU_ADD_TEST(suite, bdev_close_while_hotremove);
 	CU_ADD_TEST(suite, bdev_open_ext);
+	CU_ADD_TEST(suite, bdev_open_ext_unregister);
 	CU_ADD_TEST(suite, bdev_set_io_timeout);
 	CU_ADD_TEST(suite, lba_range_overlap);
 	CU_ADD_TEST(suite, lock_lba_range_check_ranges);
@@ -5066,6 +5411,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_get_memory_domains);
 	CU_ADD_TEST(suite, bdev_writev_readv_ext);
 	CU_ADD_TEST(suite, bdev_register_uuid_alias);
+	CU_ADD_TEST(suite, bdev_unregister_by_name);
+	CU_ADD_TEST(suite, for_each_bdev_test);
 
 	allocate_cores(1);
 	allocate_threads(1);

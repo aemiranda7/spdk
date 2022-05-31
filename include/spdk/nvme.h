@@ -227,9 +227,10 @@ struct spdk_nvme_ctrlr_opts {
 	bool disable_error_logging;
 
 	/**
-	 * It is used for RDMA transport
+	 * It is used for both RDMA & TCP transport
 	 * Specify the transport ACK timeout. The value should be in range 0-31 where 0 means
-	 * use driver-specific default value. The value is applied to each RDMA qpair
+	 * use driver-specific default value.
+	 * RDMA: The value is applied to each qpair
 	 * and affects the time that qpair waits for transport layer acknowledgement
 	 * until it retransmits a packet. The value should be chosen empirically
 	 * to meet the needs of a particular application. A low value means less time
@@ -237,6 +238,11 @@ struct spdk_nvme_ctrlr_opts {
 	 * A large value can increase the time the connection is closed.
 	 * The value of ACK timeout is calculated according to the formula
 	 * 4.096 * 2^(transport_ack_timeout) usec.
+	 * TCP: The value is applied to each qpair
+	 * and affects the time that qpair waits for transport layer acknowledgement
+	 * until connection is closed forcefully.
+	 * The value of ACK timeout is calculated according to the formula
+	 * 2^(transport_ack_timeout) msec.
 	 */
 	uint8_t transport_ack_timeout;
 
@@ -1068,6 +1074,7 @@ int spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Inform the driver that the application is preparing to reset the specified NVMe controller.
+ * (Deprecated, please use spdk_nvme_ctrlr_disconnect() before freeing I/O qpairs instead.)
  *
  * This function allows the driver to make decisions knowing that a reset is about to happen.
  * For example, the pcie transport in this case could skip sending DELETE_CQ and DELETE_SQ
@@ -1076,46 +1083,6 @@ int spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr);
  * \param ctrlr Opaque handle to NVMe controller.
  */
 void spdk_nvme_ctrlr_prepare_for_reset(struct spdk_nvme_ctrlr *ctrlr);
-
-struct spdk_nvme_ctrlr_reset_ctx;
-
-/**
- * Create a context object that can be polled to perform a full hardware reset of the NVMe controller.
- * (Deprecated, please use spdk_nvme_ctrlr_disconnect(), spdk_nvme_ctrlr_reconnect_async(), and
- * spdk_nvme_ctrlr_reconnect_poll_async() instead.)
- *
- * The function will set the controller reset context on success, user must call
- * spdk_nvme_ctrlr_reset_poll_async() until it returns a value other than -EAGAIN.
- *
- * \param ctrlr Opaque handle to NVMe controller.
- * \param reset_ctx Double pointer to reset context.
- *
- * \return 0 on success.
- * \return -ENOMEM if context could not be allocated.
- * \return -EBUSY if controller is already resetting.
- * \return -ENXIO if controller has been removed.
- *
- */
-int spdk_nvme_ctrlr_reset_async(struct spdk_nvme_ctrlr *ctrlr,
-				struct spdk_nvme_ctrlr_reset_ctx **reset_ctx);
-
-/**
- * Proceed with resetting controller associated with the controller reset context.
- * (Deprecated, please use spdk_nvme_ctrlr_disconnect(), spdk_nvme_ctrlr_reconnect_async(), and
- * spdk_nvme_ctrlr_reconnect_poll_async() instead.)
- *
- * The controller reset context is one returned from a previous call to
- * spdk_nvme_ctrlr_reset_async().  Users must call this function on the
- * controller reset context until it returns a value other than -EAGAIN.
- *
- * \param ctrlr_reset_ctx Context used to track controller reset actions.
- *
- * \return 0 if all controller reset operations are complete; the ctrlr_reset_ctx
- * is also freed and no longer valid.
- * \return -EAGAIN if there are still pending controller reset operations; user must call
- * spdk_nvme_ctrlr_reset_poll_async again to continue progress.
- */
-int spdk_nvme_ctrlr_reset_poll_async(struct spdk_nvme_ctrlr_reset_ctx *ctrlr_reset_ctx);
 
 /**
  * Disconnect the given NVMe controller.
