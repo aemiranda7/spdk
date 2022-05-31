@@ -52,6 +52,8 @@ LIBS_FOLDER_INCLUDE := fault-injection-framework/libs/libfops/build
 
 LIBS += $(SPDK_LIB_LINKER_ARGS)
 
+LIBS += `pkg-config --libs glib-2.0`
+
 CLEAN_FILES = $(APP)
 
 ifeq ($(findstring vfio_user,$(SPDK_LIB_FILES)),vfio_user)

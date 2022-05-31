@@ -38,7 +38,9 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 3
 SO_MINOR := 0
 
+CFLAGS += `pkg-config --cflags glib-2.0`
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
+LDFLAGS += `pkg-config --libs glib-2.0`
 LDFLAGS += -L$(FAULT_INJECTION_LIB) -lfops
 
 C_SRCS = vbdev_faulty.c vbdev_faulty_rpc.c

@@ -40,6 +40,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/cpuset.h"
+#include "spdk/libfops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,33 @@ enum spdk_thread_poller_rc {
 	SPDK_POLLER_IDLE,
 	SPDK_POLLER_BUSY,
 };
+
+
+typedef enum faultType{
+    CORRUPT_BUFFER, /**< Corrupt the content of the buffer */
+    DELAY_OPERATION, /**< Delays the operation */
+    MEDIUM_ERROR /**< Returns a given error */
+} FaultType;
+
+struct fault_injection_tag{
+	bool inject_fault;
+	FaultType fault_type;
+	union{
+		struct {
+			BufferCorruptionPattern pattern;
+			int customOffset;
+			int customIndex;
+		} content_corruption;
+		double delay_time;
+		int error_number;
+	}u;
+};
+
+struct bs_file_id{
+	char* file_name;
+};
+
+
 
 /**
  * A stackless, lightweight thread.
@@ -869,6 +897,14 @@ int spdk_interrupt_mode_enable(void);
  * \return True if interrupt mode is set, false otherwise.
  */
 bool spdk_interrupt_mode_is_enabled(void);
+
+struct fault_injection_tag* spdk_thread_get_tag(void);
+
+void spdk_thread_set_tag (struct fault_injection_tag *tag);
+
+struct bs_file_id* spdk_thread_get_file_id(void);
+
+void spdk_thread_set_file_id (struct bs_file_id *file_id);
 
 #ifdef __cplusplus
 }

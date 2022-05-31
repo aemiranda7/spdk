@@ -38,6 +38,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "glib.h"
 
 #include "vbdev_faulty.h"
 #include "spdk/rpc.h"
@@ -66,6 +67,11 @@ static struct spdk_bdev_module faulty_if = {
 	.module_fini = vbdev_faulty_finish,
 	.config_json = vbdev_faulty_config_json
 };
+
+
+GHashTable *write_hashtable;
+GHashTable *read_hashtable;
+
 
 SPDK_BDEV_MODULE_REGISTER(faulty, &faulty_if)
 
@@ -111,6 +117,8 @@ struct faulty_bdev_io {
 	/* for bdev_io_wait */
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
 };
+
+
 
 static void
 vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
@@ -288,6 +296,34 @@ pt_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, boo
 	}
 }
 
+
+static int 
+corrupt(struct spdk_bdev_io *bdev_io, struct fault_injection_tag *flag){
+	int rc = 0;
+	switch (flag->fault_type)
+	{
+	case CORRUPT_BUFFER:
+		SPDK_NOTICELOG("Corrupting the content!");
+		corrupt_buffer(bdev_io->u.bdev.iovs->iov_base,bdev_io->u.bdev.iovs->iov_len,
+		               flag->u.content_corruption.pattern,flag->u.content_corruption.customOffset,
+					   flag->u.content_corruption.customIndex);
+		break;
+
+	case DELAY_OPERATION:
+		SPDK_NOTICELOG("Delaying the operation!");
+		operation_delay(flag->u.delay_time);
+		break;
+
+	case MEDIUM_ERROR:
+		SPDK_NOTICELOG("Returning an error!");
+		rc = medium_error(flag->u.error_number);
+		break;
+	default:
+		break;
+	}
+	return rc;
+}
+
 /* Called when someone above submits IO to this pt vbdev. We're simply passing it on here
  * via SPDK IO calls which in turn allocate another bdev IO and call our cpl callback provided
  * below along with the original bdev_io so that we can complete it once this IO completes.
@@ -299,6 +335,7 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 	struct pt_io_channel *pt_ch = spdk_io_channel_get_ctx(ch);
 	struct faulty_bdev_io *io_ctx = (struct faulty_bdev_io *)bdev_io->driver_ctx;
 	int rc = 0;
+	
 
 	/* Setup a per IO context value; we don't do anything with it in the vbdev other
 	 * than confirm we get the same thing back in the completion callback just to
@@ -314,12 +351,21 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if (bdev_io->u.bdev.md_buf == NULL) {
 			//corrupt_buffer(bdev_io->u.bdev.iovs->iov_base,bdev_io->u.bdev.iovs->iov_len,REPLACE_ALL_ZEROS,-1,-1);
-			operation_delay(5);
-		        //bdev_io->u.bdev.iovs->iov_base = "Vamos World!";	
-			rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
+			//operation_delay(5);
+
+			//corrupt(bdev_io,spdk_thread_get_tag());
+			struct bs_file_id* file_id = spdk_thread_get_file_id();
+			if(file_id){
+				if(file_id->file_name){
+					 printf("This write is for the file %s\n",file_id->file_name);
+					 printf("The content of write is : %s\n",bdev_io->u.bdev.iovs->iov_base);
+				}
+			}
+		    rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
 						     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
 						     bdev_io->u.bdev.num_blocks, _pt_complete_io,
 						     bdev_io);
+			
 			//rc = medium_error(-1);
 		} else {
 			rc = spdk_bdev_writev_blocks_with_md(pt_node->base_desc, pt_ch->base_ch,
@@ -520,6 +566,8 @@ vbdev_faulty_insert_name(const char *bdev_name, const char *vbdev_name)
 static int
 vbdev_faulty_init(void)
 {
+	write_hashtable = g_hash_table_new(g_str_hash,g_str_equal); 
+	read_hashtable  = g_hash_table_new(g_str_hash,g_str_equal);
 	return 0;
 }
 
