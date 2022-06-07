@@ -56,12 +56,13 @@ enum spdk_thread_poller_rc {
 };
 
 
-typedef enum faultType{
-    CORRUPT_BUFFER, /**< Corrupt the content of the buffer */
-    DELAY_OPERATION, /**< Delays the operation */
-    MEDIUM_ERROR /**< Returns a given error */
-} FaultType;
+//typedef enum faultType{
+//    CORRUPT_BUFFER, /**< Corrupt the content of the buffer */
+//    DELAY_OPERATION, /**< Delays the operation */
+//    MEDIUM_ERROR /**< Returns a given error */
+//} FaultType;
 
+/*
 struct fault_injection_tag{
 	bool inject_fault;
 	FaultType fault_type;
@@ -74,7 +75,7 @@ struct fault_injection_tag{
 		double delay_time;
 		int error_number;
 	}u;
-};
+};*/
 
 struct bs_file_id{
 	char* file_name;

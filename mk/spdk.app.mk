@@ -54,6 +54,8 @@ LIBS += $(SPDK_LIB_LINKER_ARGS)
 
 LIBS += `pkg-config --libs glib-2.0`
 
+LIBS += -L/usr/include/json-c -ljson-c
+
 CLEAN_FILES = $(APP)
 
 ifeq ($(findstring vfio_user,$(SPDK_LIB_FILES)),vfio_user)

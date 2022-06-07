@@ -42,6 +42,7 @@ CFLAGS += `pkg-config --cflags glib-2.0`
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
 LDFLAGS += `pkg-config --libs glib-2.0`
 LDFLAGS += -L$(FAULT_INJECTION_LIB) -lfops
+LDFLAGS += -L/usr/include/json-c -ljson-c
 
 C_SRCS = vbdev_faulty.c vbdev_faulty_rpc.c
 LIBNAME = bdev_faulty

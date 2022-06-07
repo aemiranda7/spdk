@@ -37,6 +37,8 @@
  * down to a bdev (or bdevs) that its configured to attach to.
  */
 
+
+#include "json-c/json.h"
 #include "spdk/stdinc.h"
 #include "glib.h"
 
@@ -48,6 +50,7 @@
 #include "spdk/thread.h"
 #include "spdk/util.h"
 #include "spdk/libfops.h" //my faults library.
+#include "spdk/file.h"
 
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
@@ -69,8 +72,41 @@ static struct spdk_bdev_module faulty_if = {
 };
 
 
+typedef enum faultType{
+    CORRUPT_CONTENT, /**< Corrupt the content of the buffer */
+    DELAY_OPERATION, /**< Delays the operation */
+    MEDIUM_ERROR /**< Returns a given error */
+} FaultType;
+
+typedef enum faultFrequency{
+	ALL, /**< Corrupt all the requests */
+	ALL_AFTER, /**< Corrupt all the requests after x requests made*/
+	INTERVAL /**< Corrupt one requests every x requests*/
+} FaultFrequency;
+
+struct spdk_file_faults{
+	int total_requests;
+	pthread_mutex_t *req_lock;
+
+	FaultType fault_type;
+	FaultFrequency fault_freq;
+	int n_requests;
+	union{
+		struct {
+			BufferCorruptionPattern pattern;
+			int customOffset;
+			int customIndex;
+		} content_corruption;
+		double delay_time;
+		int error_number;
+	}u;
+};
+
+
 GHashTable *write_hashtable;
 GHashTable *read_hashtable;
+
+
 
 
 SPDK_BDEV_MODULE_REGISTER(faulty, &faulty_if)
@@ -118,7 +154,22 @@ struct faulty_bdev_io {
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
 };
 
+//-------------------------------my added functions----------------------------------
+static void 
+corrupt_request_file(struct spdk_bdev_io *bdev_io,char* fileName);
 
+static void 
+_print_corruption_pattern(BufferCorruptionPattern pattern);
+
+static void 
+_print_fault_struct (gpointer key, gpointer value, gpointer user_data);
+
+static void 
+_print_write_hastable(void);
+
+static int 
+vbdev_read_conf_file(void);
+//----------------------------------end of my added functions--------------------------/
 
 static void
 vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
@@ -297,7 +348,7 @@ pt_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, boo
 }
 
 
-static int 
+/*static int 
 corrupt(struct spdk_bdev_io *bdev_io, struct fault_injection_tag *flag){
 	int rc = 0;
 	switch (flag->fault_type)
@@ -322,7 +373,7 @@ corrupt(struct spdk_bdev_io *bdev_io, struct fault_injection_tag *flag){
 		break;
 	}
 	return rc;
-}
+}*/
 
 /* Called when someone above submits IO to this pt vbdev. We're simply passing it on here
  * via SPDK IO calls which in turn allocate another bdev IO and call our cpl callback provided
@@ -358,7 +409,8 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 			if(file_id){
 				if(file_id->file_name){
 					 printf("This write is for the file %s\n",file_id->file_name);
-					 printf("The content of write is : %s\n",bdev_io->u.bdev.iovs->iov_base);
+					 printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
+					 corrupt_request_file(bdev_io,file_id->file_name);
 				}
 			}
 		    rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
@@ -568,6 +620,7 @@ vbdev_faulty_init(void)
 {
 	write_hashtable = g_hash_table_new(g_str_hash,g_str_equal); 
 	read_hashtable  = g_hash_table_new(g_str_hash,g_str_equal);
+	vbdev_read_conf_file();
 	return 0;
 }
 
@@ -831,5 +884,399 @@ vbdev_faulty_examine(struct spdk_bdev *bdev)
 
 	spdk_bdev_module_examine_done(&faulty_if);
 }
+
+static void _print_corruption_pattern(BufferCorruptionPattern pattern){
+	switch (pattern)
+	{
+	case REPLACE_ALL_ZEROS:
+		printf("corruptionPattern: REPLACE_ALL_ZEROS\n");
+		break;
+	case REPLACE_ALL_ONES:
+		printf("corruptionPattern: REPLACE_ALL_ONES\n");
+		break;
+	case BITFLIP_RANDOM_INDEX:
+		printf("corruptionPattern: BITFLIP_RANDOM_INDEX\n");
+		break;
+	case BITFLIP_CUSTOM_INDEX:
+		printf("corruptionPattern: BITFLIP_CUSTOM_INDEX\n");
+		break;
+	default:
+		break;
+	}
+}
+
+static void _print_fault_struct (gpointer key, gpointer value, gpointer user_data){
+
+	printf("fileName : %s\n",(char*)key);
+	struct spdk_file_faults *fault = (struct spdk_file_faults *) value;
+
+	switch (fault->fault_freq)
+	{
+	case ALL:
+		printf("faultFreq: ALL\n");
+		break;
+	case ALL_AFTER:
+		printf("faultFreq: ALL_AFTER\n");
+		printf("nReq: %d\n",fault->n_requests);
+		break;
+	case INTERVAL:
+		printf("faultFreq: INTERVAL\n");
+		printf("nReq: %d\n",fault->n_requests);
+		break;
+	default:
+		break;
+	}
+	
+	
+	switch (fault->fault_type)
+	{
+		case CORRUPT_CONTENT:
+			printf("faultType: CORRUPT_CONTENT\n");
+			_print_corruption_pattern(fault->u.content_corruption.pattern);
+			if(fault->u.content_corruption.pattern==BITFLIP_CUSTOM_INDEX){
+				printf("customOffset: %d\n",fault->u.content_corruption.customOffset);
+				printf("customIndex: %d\n",fault->u.content_corruption.customIndex);
+			}
+			break;
+		case DELAY_OPERATION:
+			printf("faultType: DELAY_OPERATION\n");
+			printf("delay_time: %f\n", fault->u.delay_time);
+			break;
+		case MEDIUM_ERROR:
+			printf("faultType: MEDIUM_ERROR\n");
+			printf("error_number: %d\n", fault->u.error_number);
+			break;
+		default:
+			break;
+	}
+}
+
+static void _print_write_hastable(void){
+	g_hash_table_foreach(write_hashtable,_print_fault_struct,NULL);
+}
+
+
+static int 
+vbdev_read_conf_file(void)
+{
+	FILE *confFile = fopen("/home/gsd/rocksdb-spdk/spdk/module/bdev/faultBdev/configFile.json","r");
+
+	if(!confFile){
+		SPDK_ERRLOG("Something went wrong opening configFile.json!!\n");
+		return -1;
+	}
+	else SPDK_NOTICELOG("Config file opened successfully\n");
+
+	size_t size;
+
+	char* data = (char*) spdk_posix_file_load(confFile,&size);
+
+	fclose(confFile);
+
+	if(!data){
+		SPDK_ERRLOG("Something went wrong reading configFile.json!!\n");
+		return -1;
+	}
+
+	struct json_object *complete_json = json_tokener_parse(data);
+
+	struct json_object *write, *read;
+
+	if(json_object_object_get_ex(complete_json,"write",&write)){
+		SPDK_NOTICELOG("Write loaded successfully!\n");
+	}
+	else SPDK_ERRLOG("Write not loaded!\n");
+
+	if(json_object_object_get_ex(complete_json,"read",&read)){
+		SPDK_NOTICELOG("Read loaded successfully!\n");
+	}
+	else SPDK_ERRLOG("Read not loaded!\n");
+
+	struct json_object *files;
+
+	if(json_object_object_get_ex(write,"files",&files)){
+		SPDK_NOTICELOG("Write files loaded successfully!\n");
+	}
+	else SPDK_ERRLOG("Write files not loaded!\n");
+
+	size_t n_files = json_object_array_length(files);
+
+	
+	
+	for(size_t i = 0; i<n_files; i++){
+
+		struct spdk_file_faults *file_faults = (struct spdk_file_faults *)malloc(sizeof(struct spdk_file_faults));
+
+
+		struct json_object *aux_file = json_object_array_get_idx(files,i);
+		struct json_object *file_name_obj;
+		if(!json_object_object_get_ex(aux_file,"fileName",&file_name_obj)){
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object lacks the \'fileName\' field so it will be ignored!\n"
+				,i);
+			continue;
+		}
+		const char* file_name_str = json_object_get_string(file_name_obj);
+		struct json_object *fault_injection_obj;
+		if(!json_object_object_get_ex(aux_file,"faultInjection",&fault_injection_obj)){
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object lacks the \'faultInjection\' field so it will be ignored!\n"
+				,i);
+			continue;
+		}
+		struct json_object *fault_injection_frequency;
+		if(!json_object_object_get_ex(fault_injection_obj,"frequency",&fault_injection_frequency)){
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object lacks the \'frequency\' field inside the faultInjection object so it will be ignored!\n"
+				,i);
+			continue;
+		}
+		const char* frequency_str = json_object_get_string(fault_injection_frequency);
+		if(strcmp(frequency_str,"ALL")==0) file_faults->fault_freq = ALL;
+		else if(strcmp(frequency_str,"ALL_AFTER")==0) file_faults->fault_freq = ALL_AFTER;
+		else if(strcmp(frequency_str,"INTERVAL")==0) file_faults->fault_freq = INTERVAL;
+		else{
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object has the \'frequency\' field inside the faultInjection object wrongly defined, so it will be ignored!\n"
+				,i);
+			continue;
+		}
+
+		struct json_object *fault_type_obj;
+		if(!json_object_object_get_ex(fault_injection_obj,"faultType",&fault_type_obj)){
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object lacks the \'faultType\' field inside the faultInjection object so it will be ignored!\n"
+				,i);
+			continue;
+		}
+		
+		struct json_object *type_obj;
+		if(!json_object_object_get_ex(fault_type_obj,"type",&type_obj)){
+			SPDK_ERRLOG(
+				"The file number %lu specified in the write object lacks the \'type\' field inside the \'faultType\' object so it will be ignored!\n"
+				,i);
+			continue;
+		}
+		const char* type_str = json_object_get_string(type_obj);
+
+		
+		if(strcmp(type_str,"CORRUPT_CONTENT")==0) file_faults->fault_type = CORRUPT_CONTENT;
+		else if(strcmp(type_str,"DELAY_OPERATION")==0) file_faults->fault_type = DELAY_OPERATION;
+		else if(strcmp(type_str,"MEDIUM_ERROR")==0) file_faults->fault_type = MEDIUM_ERROR;
+		else{
+				SPDK_ERRLOG(
+					"The file number %lu specified in the write object has the \'type\' field inside the faultType object wrongly defined, so it will be ignored!\n"
+					,i);
+				continue;
+			}
+		
+
+		if(file_faults->fault_type==CORRUPT_CONTENT){
+
+			struct json_object *corruption_obj;
+			if(!json_object_object_get_ex(fault_type_obj,"corruptionPattern",&corruption_obj)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the write object lacks the \'corruptionPattern\' field inside the \'faultType\' object that must be defined when the \'type\' is defined as \'CORRUPT_CONTENT\' so it will be ignored!\n"
+					,i);
+				continue;
+			}
+			const char* corruption_str = json_object_get_string(corruption_obj);
+			
+			if(strcmp(corruption_str,"REPLACE_ALL_ZEROS")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ZEROS;
+			else if(strcmp(corruption_str,"REPLACE_ALL_ONES")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ONES;
+			else if(strcmp(corruption_str,"BITFLIP_RANDOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_RANDOM_INDEX;
+			else if(strcmp(corruption_str,"BITFLIP_CUSTOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_CUSTOM_INDEX;
+			else{
+				SPDK_ERRLOG(
+					"The file number %lu specified in the write object has the \'corruptionPattern\' field inside the faultType object wrongly defined, so it will be ignored!\n"
+					,i);
+				continue;
+			}
+			
+			struct json_object *offset_obj;
+			struct json_object *index_obj;
+			
+			switch (file_faults->u.content_corruption.pattern)
+			{
+				case BITFLIP_CUSTOM_INDEX:
+
+					if(!json_object_object_get_ex(fault_type_obj,"offset",&offset_obj)){
+					SPDK_WARNLOG(
+						"The file number %lu specified in the write object lacks the \'offset\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
+						,i);
+					}
+					else{
+						if(json_object_is_type(offset_obj,json_type_int)){
+							file_faults->u.content_corruption.customOffset = json_object_get_int(offset_obj);
+							if (file_faults->u.content_corruption.customOffset<0){
+								SPDK_WARNLOG(
+									"The file number %lu specified in the write object must have the \'offset\' field >=0 so it will be set to the default 0!\n"
+									,i);							
+								file_faults->u.content_corruption.customOffset=0;
+							}
+						}
+						else SPDK_WARNLOG(
+									"The file number %lu specified in the write object must have the \'offset\' defined has an integer. It will be set to the default 0!\n"
+									,i);					
+					}	
+
+				
+					if(!json_object_object_get_ex(fault_type_obj,"index",&index_obj)){
+					SPDK_WARNLOG(
+						"The file number %lu specified in the write object lacks the \'index\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
+						,i);
+					}
+					else{
+						if(json_object_is_type(index_obj,json_type_int)){
+							file_faults->u.content_corruption.customIndex = json_object_get_int(index_obj);
+							if (file_faults->u.content_corruption.customIndex<0 || file_faults->u.content_corruption.customIndex>=8){
+								SPDK_WARNLOG(
+									"The file number %lu specified in the write object must have the \'index\' field >=0 and <8 so it will be set to the default 0!\n"
+									,i);							
+								file_faults->u.content_corruption.customIndex=0;
+							}
+						}
+						else SPDK_WARNLOG(
+									"The file number %lu specified in the write object must have the \'index\' defined has an integer. It will be set to the default 0!\n"
+									,i);					
+					}
+					break;
+				default:
+					break;
+			}
+		}
+
+		else if(file_faults->fault_type==DELAY_OPERATION){
+			struct json_object *time_obj;
+			if(!json_object_object_get_ex(fault_type_obj,"time",&time_obj)){
+				SPDK_WARNLOG(
+					"The file number %lu specified in the write object lacks the \'time\' field inside the \'faultType\' object which should be defined when the field type is \'DELAY_OPERATION\' so it will be set to the default 0!\n"
+					,i);
+			}
+			else{
+				if(json_object_is_type(time_obj,json_type_double)){
+						file_faults->u.delay_time = json_object_get_double(time_obj);
+						if(file_faults->u.delay_time<0){
+							SPDK_WARNLOG(
+								"The file number %lu specified in the write object must have the \'time\' field >=0 so it will be set to the default 0!\n"
+								,i);
+							file_faults->u.delay_time = 0;
+						}
+					}
+					else SPDK_WARNLOG(
+								"The file number %lu specified in the write object must have the \'time\' defined has a double. It will be set to the default 0!\n"
+								,i);
+			}
+		}
+
+		else if(file_faults->fault_type==MEDIUM_ERROR){
+			struct json_object *err_obj;
+			if(!json_object_object_get_ex(fault_type_obj,"error",&err_obj)){
+				SPDK_WARNLOG(
+					"The file number %lu specified in the write object lacks the \'error\' field inside the \'faultType\' object which should be defined when the field type is \'MEDIUM_ERROR\' so it will be set to the default 0!\n"
+					,i);
+			}
+			else{
+				if(json_object_is_type(err_obj,json_type_int)){
+						file_faults->u.error_number = json_object_get_int(err_obj);
+					}
+					else SPDK_WARNLOG(
+								"The file number %lu specified in the write object must have the \'error\' field defined has an integer. It will be set to the default 0!\n"
+								,i);
+			}
+		}
+
+
+		file_faults->n_requests = 1;
+		struct json_object *nRequests_obj;
+		switch (file_faults->fault_freq)
+		{
+			case ALL: 
+				break;
+			case ALL_AFTER:
+			case INTERVAL:
+				
+				if(!json_object_object_get_ex(fault_injection_obj,"nRequests",&nRequests_obj)){
+				SPDK_WARNLOG(
+					"The file number %lu specified in the write object lacks the \'nRequests\' field inside the \'faultType\' object which should be defined when the field frequency is \'ALL_AFTER\' or \'INTERVAL\' so it will be set to the default 1!\n"
+					,i);
+				}
+				else{
+					if(json_object_is_type(nRequests_obj,json_type_int)){
+						file_faults->n_requests = json_object_get_int(nRequests_obj);
+						if(file_faults->n_requests<=0){
+							SPDK_WARNLOG(
+								"The file number %lu specified in the write object must have the \'nRequests\' field >0 so it will be set to the default 1!\n"
+								,i);
+							file_faults->n_requests = 1;
+						}
+					}
+					else SPDK_WARNLOG(
+								"The file number %lu specified in the write object must have the \'nRequests\' defined has an integer. It will be set to the default 1!\n"
+								,i);
+				}
+				break;
+		
+			default:
+				break;
+		}
+
+		file_faults->total_requests=0;
+		file_faults->req_lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+		pthread_mutex_init(file_faults->req_lock,NULL);
+
+
+
+		g_hash_table_insert(write_hashtable,strdup(file_name_str),file_faults);
+		
+
+
+
+	}
+
+	_print_write_hastable();
+
+	return 0;
+}
+
+static void
+corrupt_request_file(struct spdk_bdev_io *bdev_io,char* fileName){
+	struct spdk_file_faults *fault = NULL;
+	if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) fault = g_hash_table_lookup(write_hashtable, fileName);
+	else if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) fault =  g_hash_table_lookup(read_hashtable, fileName);
+	else return;
+
+	if (!fault) return;
+
+	pthread_mutex_lock(fault->req_lock);
+	int current_total_requests = fault->total_requests++;
+	pthread_mutex_unlock(fault->req_lock);
+
+	//If freq is all_after x and total requests is not bigger than x then do not corrupt
+	if(fault->fault_freq == ALL_AFTER && current_total_requests<=fault->n_requests) return;
+
+	//If freq is interval of x and total requests can not be divided by x then do not corrupt
+	if(fault->fault_freq == INTERVAL && (current_total_requests%fault->n_requests)!=0) return;
+
+	switch (fault->fault_type)
+	{
+	case CORRUPT_CONTENT:
+		corrupt_buffer(bdev_io->u.bdev.iovs->iov_base,
+					   bdev_io->u.bdev.iovs->iov_len,
+					   fault->u.content_corruption.pattern,
+					   fault->u.content_corruption.customOffset,
+					   fault->u.content_corruption.customIndex);
+		break;
+	case DELAY_OPERATION:
+		operation_delay(fault->u.delay_time);
+		break;
+	case MEDIUM_ERROR:
+		//TODO
+		break;
+	default:
+		break;
+	}
+}
+
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_faulty)
