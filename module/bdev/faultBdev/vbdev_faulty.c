@@ -165,7 +165,7 @@ static void
 _print_fault_struct (gpointer key, gpointer value, gpointer user_data);
 
 static void 
-_print_write_hastable(void);
+_print_hashtable(GHashTable *hashtable);
 
 static int 
 vbdev_read_conf_file(void);
@@ -951,8 +951,256 @@ static void _print_fault_struct (gpointer key, gpointer value, gpointer user_dat
 	}
 }
 
-static void _print_write_hastable(void){
-	g_hash_table_foreach(write_hashtable,_print_fault_struct,NULL);
+static void _print_hashtable(GHashTable * hashtable){
+	g_hash_table_foreach(hashtable,_print_fault_struct,NULL);
+}
+
+
+static void _load_wr_files(struct json_object *write, struct json_object *read){
+	GHashTable *aux_hash[2] = {write_hashtable,read_hashtable};
+	json_object *aux[2] = {write,read};
+	char *aux_str[2]; 
+	aux_str[0] = strdup("write"); 
+	aux_str[1] = strdup("read");
+
+	for(int a = 0; a<2; a++){
+		struct json_object *files;
+
+		if(json_object_object_get_ex(aux[a],"files",&files)){
+			SPDK_NOTICELOG("%s files loaded successfully!\n",aux_str[a]);
+		}
+		else SPDK_ERRLOG("%s files not loaded!\n",aux_str[a]);
+
+		size_t n_files = json_object_array_length(files);
+
+		
+		
+		for(size_t i = 0; i<n_files; i++){
+
+			struct spdk_file_faults *file_faults = (struct spdk_file_faults *)malloc(sizeof(struct spdk_file_faults));
+
+
+			struct json_object *aux_file = json_object_array_get_idx(files,i);
+			struct json_object *file_name_obj;
+			if(!json_object_object_get_ex(aux_file,"fileName",&file_name_obj)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object lacks the \'fileName\' field so it will be ignored!\n"
+					,i,aux_str[a]);
+				continue;
+			}
+			const char* file_name_str = json_object_get_string(file_name_obj);
+			struct json_object *fault_injection_obj;
+			if(!json_object_object_get_ex(aux_file,"faultInjection",&fault_injection_obj)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object lacks the \'faultInjection\' field so it will be ignored!\n"
+					,i,aux_str[a]);
+				continue;
+			}
+			struct json_object *fault_injection_frequency;
+			if(!json_object_object_get_ex(fault_injection_obj,"frequency",&fault_injection_frequency)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object lacks the \'frequency\' field inside the faultInjection object so it will be ignored!\n"
+					,i,aux_str[a]);
+				continue;
+			}
+			const char* frequency_str = json_object_get_string(fault_injection_frequency);
+			if(strcmp(frequency_str,"ALL")==0) file_faults->fault_freq = ALL;
+			else if(strcmp(frequency_str,"ALL_AFTER")==0) file_faults->fault_freq = ALL_AFTER;
+			else if(strcmp(frequency_str,"INTERVAL")==0) file_faults->fault_freq = INTERVAL;
+			else{
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object has the \'frequency\' field inside the faultInjection object wrongly defined, so it will be ignored!\n"
+					,i,aux_str[a]);
+				continue;
+			}
+
+			struct json_object *fault_type_obj;
+			if(!json_object_object_get_ex(fault_injection_obj,"faultType",&fault_type_obj)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object lacks the \'faultType\' field inside the faultInjection object so it will be ignored!\n"
+					,i,aux_str[a]);
+				continue;
+			}
+			
+			struct json_object *type_obj;
+			if(!json_object_object_get_ex(fault_type_obj,"type",&type_obj)){
+				SPDK_ERRLOG(
+					"The file number %lu specified in the %s object lacks the \'type\' field inside the \'faultType\' object so it will be ignored!\n"
+					,i, aux_str[a]);
+				continue;
+			}
+			const char* type_str = json_object_get_string(type_obj);
+
+			
+			if(strcmp(type_str,"CORRUPT_CONTENT")==0) file_faults->fault_type = CORRUPT_CONTENT;
+			else if(strcmp(type_str,"DELAY_OPERATION")==0) file_faults->fault_type = DELAY_OPERATION;
+			else if(strcmp(type_str,"MEDIUM_ERROR")==0) file_faults->fault_type = MEDIUM_ERROR;
+			else{
+					SPDK_ERRLOG(
+						"The file number %lu specified in the %s object has the \'type\' field inside the faultType object wrongly defined, so it will be ignored!\n"
+						,i, aux_str[a]);
+					continue;
+				}
+			
+
+			if(file_faults->fault_type==CORRUPT_CONTENT){
+
+				struct json_object *corruption_obj;
+				if(!json_object_object_get_ex(fault_type_obj,"corruptionPattern",&corruption_obj)){
+					SPDK_ERRLOG(
+						"The file number %lu specified in the %s object lacks the \'corruptionPattern\' field inside the \'faultType\' object that must be defined when the \'type\' is defined as \'CORRUPT_CONTENT\' so it will be ignored!\n"
+						,i, aux_str[a]);
+					continue;
+				}
+				const char* corruption_str = json_object_get_string(corruption_obj);
+				
+				if(strcmp(corruption_str,"REPLACE_ALL_ZEROS")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ZEROS;
+				else if(strcmp(corruption_str,"REPLACE_ALL_ONES")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ONES;
+				else if(strcmp(corruption_str,"BITFLIP_RANDOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_RANDOM_INDEX;
+				else if(strcmp(corruption_str,"BITFLIP_CUSTOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_CUSTOM_INDEX;
+				else{
+					SPDK_ERRLOG(
+						"The file number %lu specified in the %s object has the \'corruptionPattern\' field inside the faultType object wrongly defined, so it will be ignored!\n"
+						,i, aux_str[a]);
+					continue;
+				}
+				
+				struct json_object *offset_obj;
+				struct json_object *index_obj;
+				
+				switch (file_faults->u.content_corruption.pattern)
+				{
+					case BITFLIP_CUSTOM_INDEX:
+
+						if(!json_object_object_get_ex(fault_type_obj,"offset",&offset_obj)){
+						SPDK_WARNLOG(
+							"The file number %lu specified in the %s object lacks the \'offset\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
+							,i, aux_str[a]);
+						}
+						else{
+							if(json_object_is_type(offset_obj,json_type_int)){
+								file_faults->u.content_corruption.customOffset = json_object_get_int(offset_obj);
+								if (file_faults->u.content_corruption.customOffset<0){
+									SPDK_WARNLOG(
+										"The file number %lu specified in the %s object must have the \'offset\' field >=0 so it will be set to the default 0!\n"
+										,i, aux_str[a]);							
+									file_faults->u.content_corruption.customOffset=0;
+								}
+							}
+							else SPDK_WARNLOG(
+										"The file number %lu specified in the %s object must have the \'offset\' defined has an integer. It will be set to the default 0!\n"
+										,i, aux_str[a]);					
+						}	
+
+					
+						if(!json_object_object_get_ex(fault_type_obj,"index",&index_obj)){
+						SPDK_WARNLOG(
+							"The file number %lu specified in the %s object lacks the \'index\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
+							,i, aux_str[a]);
+						}
+						else{
+							if(json_object_is_type(index_obj,json_type_int)){
+								file_faults->u.content_corruption.customIndex = json_object_get_int(index_obj);
+								if (file_faults->u.content_corruption.customIndex<0 || file_faults->u.content_corruption.customIndex>=8){
+									SPDK_WARNLOG(
+										"The file number %lu specified in the %s object must have the \'index\' field >=0 and <8 so it will be set to the default 0!\n"
+										,i, aux_str[a]);							
+									file_faults->u.content_corruption.customIndex=0;
+								}
+							}
+							else SPDK_WARNLOG(
+										"The file number %lu specified in the %s object must have the \'index\' defined has an integer. It will be set to the default 0!\n"
+										,i, aux_str[a]);					
+						}
+						break;
+					default:
+						break;
+				}
+			}
+
+			else if(file_faults->fault_type==DELAY_OPERATION){
+				struct json_object *time_obj;
+				if(!json_object_object_get_ex(fault_type_obj,"time",&time_obj)){
+					SPDK_WARNLOG(
+						"The file number %lu specified in the %s lacks the \'time\' field inside the \'faultType\' object which should be defined when the field type is \'DELAY_OPERATION\' so it will be set to the default 0!\n"
+						,i,aux_str[a]);
+				}
+				else{
+					if(json_object_is_type(time_obj,json_type_double)){
+							file_faults->u.delay_time = json_object_get_double(time_obj);
+							if(file_faults->u.delay_time<0){
+								SPDK_WARNLOG(
+									"The file number %lu specified in the %s must have the \'time\' field >=0 so it will be set to the default 0!\n"
+									,i,aux_str[a]);
+								file_faults->u.delay_time = 0;
+							}
+						}
+						else SPDK_WARNLOG(
+									"The file number %lu specified in the %s must have the \'time\' defined has a double. It will be set to the default 0!\n"
+									,i,aux_str[a]);
+				}
+			}
+
+			else if(file_faults->fault_type==MEDIUM_ERROR){
+				struct json_object *err_obj;
+				if(!json_object_object_get_ex(fault_type_obj,"error",&err_obj)){
+					SPDK_WARNLOG(
+						"The file number %lu specified in the %s lacks the \'error\' field inside the \'faultType\' object which should be defined when the field type is \'MEDIUM_ERROR\' so it will be set to the default 0!\n"
+						,i,aux_str[a]);
+				}
+				else{
+					if(json_object_is_type(err_obj,json_type_int)){
+							file_faults->u.error_number = json_object_get_int(err_obj);
+						}
+						else SPDK_WARNLOG(
+									"The file number %lu specified in the %s must have the \'error\' field defined has an integer. It will be set to the default 0!\n"
+									,i,aux_str[a]);
+				}
+			}
+
+
+			file_faults->n_requests = 1;
+			struct json_object *nRequests_obj;
+			switch (file_faults->fault_freq)
+			{
+				case ALL: 
+					break;
+				case ALL_AFTER:
+				case INTERVAL:
+					
+					if(!json_object_object_get_ex(fault_injection_obj,"nRequests",&nRequests_obj)){
+					SPDK_WARNLOG(
+						"The file number %lu specified in the %s lacks the \'nRequests\' field inside the \'faultType\' object which should be defined when the field frequency is \'ALL_AFTER\' or \'INTERVAL\' so it will be set to the default 1!\n"
+						,i, aux_str[a]);
+					}
+					else{
+						if(json_object_is_type(nRequests_obj,json_type_int)){
+							file_faults->n_requests = json_object_get_int(nRequests_obj);
+							if(file_faults->n_requests<=0){
+								SPDK_WARNLOG(
+									"The file number %lu specified in the %s must have the \'nRequests\' field >0 so it will be set to the default 1!\n"
+									,i, aux_str[a]);
+								file_faults->n_requests = 1;
+							}
+						}
+						else SPDK_WARNLOG(
+									"The file number %lu specified in the %s must have the \'nRequests\' defined has an integer. It will be set to the default 1!\n"
+									,i, aux_str[a]);
+					}
+					break;
+			
+				default:
+					break;
+			}
+
+			file_faults->total_requests=0;
+			file_faults->req_lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+			pthread_mutex_init(file_faults->req_lock,NULL);
+
+			g_hash_table_insert(aux_hash[a],strdup(file_name_str),file_faults);
+		
+		}
+	}
 }
 
 
@@ -992,249 +1240,13 @@ vbdev_read_conf_file(void)
 	}
 	else SPDK_ERRLOG("Read not loaded!\n");
 
-	struct json_object *files;
+	_load_wr_files(write,read);
 
-	if(json_object_object_get_ex(write,"files",&files)){
-		SPDK_NOTICELOG("Write files loaded successfully!\n");
-	}
-	else SPDK_ERRLOG("Write files not loaded!\n");
+	printf("\n------------------WRITE HASHTABLE----------------\n");
+	_print_hashtable(write_hashtable);
 
-	size_t n_files = json_object_array_length(files);
-
-	
-	
-	for(size_t i = 0; i<n_files; i++){
-
-		struct spdk_file_faults *file_faults = (struct spdk_file_faults *)malloc(sizeof(struct spdk_file_faults));
-
-
-		struct json_object *aux_file = json_object_array_get_idx(files,i);
-		struct json_object *file_name_obj;
-		if(!json_object_object_get_ex(aux_file,"fileName",&file_name_obj)){
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object lacks the \'fileName\' field so it will be ignored!\n"
-				,i);
-			continue;
-		}
-		const char* file_name_str = json_object_get_string(file_name_obj);
-		struct json_object *fault_injection_obj;
-		if(!json_object_object_get_ex(aux_file,"faultInjection",&fault_injection_obj)){
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object lacks the \'faultInjection\' field so it will be ignored!\n"
-				,i);
-			continue;
-		}
-		struct json_object *fault_injection_frequency;
-		if(!json_object_object_get_ex(fault_injection_obj,"frequency",&fault_injection_frequency)){
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object lacks the \'frequency\' field inside the faultInjection object so it will be ignored!\n"
-				,i);
-			continue;
-		}
-		const char* frequency_str = json_object_get_string(fault_injection_frequency);
-		if(strcmp(frequency_str,"ALL")==0) file_faults->fault_freq = ALL;
-		else if(strcmp(frequency_str,"ALL_AFTER")==0) file_faults->fault_freq = ALL_AFTER;
-		else if(strcmp(frequency_str,"INTERVAL")==0) file_faults->fault_freq = INTERVAL;
-		else{
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object has the \'frequency\' field inside the faultInjection object wrongly defined, so it will be ignored!\n"
-				,i);
-			continue;
-		}
-
-		struct json_object *fault_type_obj;
-		if(!json_object_object_get_ex(fault_injection_obj,"faultType",&fault_type_obj)){
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object lacks the \'faultType\' field inside the faultInjection object so it will be ignored!\n"
-				,i);
-			continue;
-		}
-		
-		struct json_object *type_obj;
-		if(!json_object_object_get_ex(fault_type_obj,"type",&type_obj)){
-			SPDK_ERRLOG(
-				"The file number %lu specified in the write object lacks the \'type\' field inside the \'faultType\' object so it will be ignored!\n"
-				,i);
-			continue;
-		}
-		const char* type_str = json_object_get_string(type_obj);
-
-		
-		if(strcmp(type_str,"CORRUPT_CONTENT")==0) file_faults->fault_type = CORRUPT_CONTENT;
-		else if(strcmp(type_str,"DELAY_OPERATION")==0) file_faults->fault_type = DELAY_OPERATION;
-		else if(strcmp(type_str,"MEDIUM_ERROR")==0) file_faults->fault_type = MEDIUM_ERROR;
-		else{
-				SPDK_ERRLOG(
-					"The file number %lu specified in the write object has the \'type\' field inside the faultType object wrongly defined, so it will be ignored!\n"
-					,i);
-				continue;
-			}
-		
-
-		if(file_faults->fault_type==CORRUPT_CONTENT){
-
-			struct json_object *corruption_obj;
-			if(!json_object_object_get_ex(fault_type_obj,"corruptionPattern",&corruption_obj)){
-				SPDK_ERRLOG(
-					"The file number %lu specified in the write object lacks the \'corruptionPattern\' field inside the \'faultType\' object that must be defined when the \'type\' is defined as \'CORRUPT_CONTENT\' so it will be ignored!\n"
-					,i);
-				continue;
-			}
-			const char* corruption_str = json_object_get_string(corruption_obj);
-			
-			if(strcmp(corruption_str,"REPLACE_ALL_ZEROS")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ZEROS;
-			else if(strcmp(corruption_str,"REPLACE_ALL_ONES")==0) file_faults->u.content_corruption.pattern = REPLACE_ALL_ONES;
-			else if(strcmp(corruption_str,"BITFLIP_RANDOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_RANDOM_INDEX;
-			else if(strcmp(corruption_str,"BITFLIP_CUSTOM_INDEX")==0) file_faults->u.content_corruption.pattern = BITFLIP_CUSTOM_INDEX;
-			else{
-				SPDK_ERRLOG(
-					"The file number %lu specified in the write object has the \'corruptionPattern\' field inside the faultType object wrongly defined, so it will be ignored!\n"
-					,i);
-				continue;
-			}
-			
-			struct json_object *offset_obj;
-			struct json_object *index_obj;
-			
-			switch (file_faults->u.content_corruption.pattern)
-			{
-				case BITFLIP_CUSTOM_INDEX:
-
-					if(!json_object_object_get_ex(fault_type_obj,"offset",&offset_obj)){
-					SPDK_WARNLOG(
-						"The file number %lu specified in the write object lacks the \'offset\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
-						,i);
-					}
-					else{
-						if(json_object_is_type(offset_obj,json_type_int)){
-							file_faults->u.content_corruption.customOffset = json_object_get_int(offset_obj);
-							if (file_faults->u.content_corruption.customOffset<0){
-								SPDK_WARNLOG(
-									"The file number %lu specified in the write object must have the \'offset\' field >=0 so it will be set to the default 0!\n"
-									,i);							
-								file_faults->u.content_corruption.customOffset=0;
-							}
-						}
-						else SPDK_WARNLOG(
-									"The file number %lu specified in the write object must have the \'offset\' defined has an integer. It will be set to the default 0!\n"
-									,i);					
-					}	
-
-				
-					if(!json_object_object_get_ex(fault_type_obj,"index",&index_obj)){
-					SPDK_WARNLOG(
-						"The file number %lu specified in the write object lacks the \'index\' field inside the \'faultType\' object which should be defined when the field type is \'BITFLIP_CUSTOM_INDEX\' so it will be set to the default 0!\n"
-						,i);
-					}
-					else{
-						if(json_object_is_type(index_obj,json_type_int)){
-							file_faults->u.content_corruption.customIndex = json_object_get_int(index_obj);
-							if (file_faults->u.content_corruption.customIndex<0 || file_faults->u.content_corruption.customIndex>=8){
-								SPDK_WARNLOG(
-									"The file number %lu specified in the write object must have the \'index\' field >=0 and <8 so it will be set to the default 0!\n"
-									,i);							
-								file_faults->u.content_corruption.customIndex=0;
-							}
-						}
-						else SPDK_WARNLOG(
-									"The file number %lu specified in the write object must have the \'index\' defined has an integer. It will be set to the default 0!\n"
-									,i);					
-					}
-					break;
-				default:
-					break;
-			}
-		}
-
-		else if(file_faults->fault_type==DELAY_OPERATION){
-			struct json_object *time_obj;
-			if(!json_object_object_get_ex(fault_type_obj,"time",&time_obj)){
-				SPDK_WARNLOG(
-					"The file number %lu specified in the write object lacks the \'time\' field inside the \'faultType\' object which should be defined when the field type is \'DELAY_OPERATION\' so it will be set to the default 0!\n"
-					,i);
-			}
-			else{
-				if(json_object_is_type(time_obj,json_type_double)){
-						file_faults->u.delay_time = json_object_get_double(time_obj);
-						if(file_faults->u.delay_time<0){
-							SPDK_WARNLOG(
-								"The file number %lu specified in the write object must have the \'time\' field >=0 so it will be set to the default 0!\n"
-								,i);
-							file_faults->u.delay_time = 0;
-						}
-					}
-					else SPDK_WARNLOG(
-								"The file number %lu specified in the write object must have the \'time\' defined has a double. It will be set to the default 0!\n"
-								,i);
-			}
-		}
-
-		else if(file_faults->fault_type==MEDIUM_ERROR){
-			struct json_object *err_obj;
-			if(!json_object_object_get_ex(fault_type_obj,"error",&err_obj)){
-				SPDK_WARNLOG(
-					"The file number %lu specified in the write object lacks the \'error\' field inside the \'faultType\' object which should be defined when the field type is \'MEDIUM_ERROR\' so it will be set to the default 0!\n"
-					,i);
-			}
-			else{
-				if(json_object_is_type(err_obj,json_type_int)){
-						file_faults->u.error_number = json_object_get_int(err_obj);
-					}
-					else SPDK_WARNLOG(
-								"The file number %lu specified in the write object must have the \'error\' field defined has an integer. It will be set to the default 0!\n"
-								,i);
-			}
-		}
-
-
-		file_faults->n_requests = 1;
-		struct json_object *nRequests_obj;
-		switch (file_faults->fault_freq)
-		{
-			case ALL: 
-				break;
-			case ALL_AFTER:
-			case INTERVAL:
-				
-				if(!json_object_object_get_ex(fault_injection_obj,"nRequests",&nRequests_obj)){
-				SPDK_WARNLOG(
-					"The file number %lu specified in the write object lacks the \'nRequests\' field inside the \'faultType\' object which should be defined when the field frequency is \'ALL_AFTER\' or \'INTERVAL\' so it will be set to the default 1!\n"
-					,i);
-				}
-				else{
-					if(json_object_is_type(nRequests_obj,json_type_int)){
-						file_faults->n_requests = json_object_get_int(nRequests_obj);
-						if(file_faults->n_requests<=0){
-							SPDK_WARNLOG(
-								"The file number %lu specified in the write object must have the \'nRequests\' field >0 so it will be set to the default 1!\n"
-								,i);
-							file_faults->n_requests = 1;
-						}
-					}
-					else SPDK_WARNLOG(
-								"The file number %lu specified in the write object must have the \'nRequests\' defined has an integer. It will be set to the default 1!\n"
-								,i);
-				}
-				break;
-		
-			default:
-				break;
-		}
-
-		file_faults->total_requests=0;
-		file_faults->req_lock = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
-		pthread_mutex_init(file_faults->req_lock,NULL);
-
-
-
-		g_hash_table_insert(write_hashtable,strdup(file_name_str),file_faults);
-		
-
-
-
-	}
-
-	_print_write_hastable();
+	printf("\n------------------READ HASHTABLE----------------\n");
+	_print_hashtable(read_hashtable);
 
 	return 0;
 }

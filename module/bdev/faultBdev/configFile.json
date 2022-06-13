@@ -41,6 +41,20 @@
      ]
   },
   "read":{
-    "files":[]
+    "files":[
+      {
+        "fileName": "testfile3",
+        "faultInjection":{
+          "frequency": "INTERVAL",
+          "nRequests": 1,
+          "faultType":{
+            "type":"CORRUPT_CONTENT",
+            "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+            "offset": 1,
+            "index": 1
+          }
+        }
+      }
+    ]
   }
 }
