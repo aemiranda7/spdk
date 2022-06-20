@@ -12,7 +12,7 @@
 
 static uint64_t g_cluster_size;
 
-
+uint32_t g_lcore = -1;
 //static bool g_thread_exit = false;
 
 struct blobfs_operation_ctx {
@@ -40,6 +40,26 @@ static void poll_threads(struct blobfs_operation_ctx* ctx){
 	while(spdk_thread_poll( ctx->main_thread, 0, 0)>0);
     if( ctx->working_thread )
         while(spdk_thread_poll(  ctx->working_thread, 0, 0)>0);
+}
+
+
+
+static void
+__call_fn(void *arg1, void *arg2)
+{
+	fs_request_fn fn;
+
+	fn = (fs_request_fn)arg1;
+	fn(arg2);
+}
+
+static void
+__send_request(fs_request_fn fn, void *arg)
+{
+	struct spdk_event *event;
+
+	event = spdk_event_allocate(g_lcore, __call_fn, (void *)fn, arg);
+	spdk_event_call(event);
 }
 
 static void
@@ -204,7 +224,7 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 
 	//spdk_set_thread( ctx->working_thread );
         
-	//ctx->sync_channel = spdk_fs_alloc_thread_ctx(ctx->fs);
+	ctx->sync_channel = spdk_fs_alloc_thread_ctx(ctx->fs);
 
 	ctx->async_channel = spdk_fs_alloc_io_channel(ctx->fs);
 
@@ -218,9 +238,9 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 	ctx->ready=false;
 
 	printf("CREATING FILE\n");
-	spdk_fs_create_file_async(fs,"testfile",create_cb,ctx);
+	spdk_fs_create_file(fs,ctx->sync_channel,"testfile");
 
-	while(!ctx->ready) poll_threads(ctx);
+	//while(!ctx->ready) poll_threads(ctx);
 
 	printf("Opening FILE\n");
 	spdk_fs_open_file_async(fs,"testfile",SPDK_BLOBFS_OPEN_CREATE,open_cb,ctx);
@@ -269,7 +289,9 @@ static void fs_init(void* arg){
 	printf("fsinit()\n");
 
 	if(ctx->fs==NULL){
-		spdk_fs_init(ctx->bs_dev, &blobfs_opt, send_request, fs_op_with_handle_complete, ctx);
+		g_lcore = spdk_env_get_first_core();
+		spdk_fs_init(ctx->bs_dev, &blobfs_opt, __send_request, fs_op_with_handle_complete, ctx);
+		printf("\ng_lcore = %ld\n",g_lcore);
 	}
 
 }
@@ -400,6 +422,7 @@ int main(int argc, char **argv)
     while( ctx->working )
     {		
         nanosleep( &ts, NULL );
+		poll_threads(ctx);
     }
 
 	blobfs_unload(ctx);

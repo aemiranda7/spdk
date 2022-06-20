@@ -1917,6 +1917,7 @@ spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *channel,
 		      void *payload, uint64_t offset, uint64_t length,
 		      spdk_file_op_complete cb_fn, void *cb_arg)
 {
+	
 	__readwrite(file, channel, payload, offset, length, cb_fn, cb_arg, 0);
 }
 
