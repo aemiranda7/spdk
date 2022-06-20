@@ -782,6 +782,11 @@ struct spdk_bdev_io {
 		void (*data_transfer_cpl)(void *ctx, int rc);
 	} internal;
 
+	/*
+	* To pass some context
+	*/
+	void* flag;
+
 	/**
 	 * Per I/O context for use by the bdev module.
 	 */

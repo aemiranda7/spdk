@@ -48,7 +48,13 @@ endif
 
 APP := $(APP)$(EXEEXT)
 
+LIBS_FOLDER_INCLUDE := fault-injection-framework/libs/libfops/build
+
 LIBS += $(SPDK_LIB_LINKER_ARGS)
+
+LIBS += `pkg-config --libs glib-2.0`
+
+LIBS += -L/usr/include/json-c -ljson-c
 
 CLEAN_FILES = $(APP)
 

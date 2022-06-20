@@ -1140,6 +1140,7 @@ def bdev_pmem_delete(client, name):
     return client.call('bdev_pmem_delete', params)
 
 
+
 def bdev_passthru_create(client, base_bdev_name, name):
     """Construct a pass-through block device.
 
@@ -1165,6 +1166,31 @@ def bdev_passthru_delete(client, name):
     """
     params = {'name': name}
     return client.call('bdev_passthru_delete', params)
+
+
+def bdev_faulty_create(client, base_bdev_name, name):
+    """Construct a pass-through block device.
+    Args:
+        base_bdev_name: name of the existing bdev
+        name: name of block device
+    Returns:
+        Name of created block device.
+    """
+    params = {
+        'base_bdev_name': base_bdev_name,
+        'name': name,
+    }
+    return client.call('bdev_faulty_create', params)
+
+
+
+def bdev_faulty_delete(client, name):
+    """Remove pass through bdev from the system.
+    Args:
+        name: name of pass through bdev to delete
+    """
+    params = {'name': name}
+    return client.call('bdev_faulty_delete', params)
 
 
 def bdev_opal_create(client, nvme_ctrlr_name, nsid, locking_range_id, range_start, range_length, password):

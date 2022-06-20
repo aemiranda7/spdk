@@ -40,7 +40,7 @@
 #include "spdk/string.h"
 #include "spdk/bdev_zone.h"
 
-static char *g_bdev_name = "Malloc0";
+static char *g_bdev_name = "Faulty0";
 
 /*
  * We'll use this struct to gather housekeeping hello_context to pass between
@@ -165,9 +165,10 @@ hello_write(void *arg)
 	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
 
 	SPDK_NOTICELOG("Writing to the bdev\n");
-	rc = spdk_bdev_write(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			     hello_context->buff, 0, length, write_complete, hello_context);
-
+	char* flag = strdup("testfile");
+	rc = spdk_bdev_write_flag(hello_context->bdev_desc, hello_context->bdev_io_channel,
+			     hello_context->buff, 0, length, flag, write_complete, hello_context);
+	free(flag);
 	if (rc == -ENOMEM) {
 		SPDK_NOTICELOG("Queueing io\n");
 		/* In case we cannot perform I/O now, queue I/O */

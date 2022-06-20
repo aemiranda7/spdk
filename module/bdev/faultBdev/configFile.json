@@ -1,0 +1,59 @@
+{
+    "write":{
+       "files":[
+         {
+           "fileName": "testfile",
+           "faultInjection":{
+             "frequency": "ALL",
+             "faultType":{
+               "type":"CORRUPT_CONTENT",
+               "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+               "offset": 1,
+               "index": 0
+             }
+           }
+         },
+         {
+          "fileName": "testfile2",
+          "faultInjection":{
+            "frequency": "ALL_AFTER",
+            "nRequests": 3,
+            "faultType":{
+              "type":"CORRUPT_CONTENT",
+              "corruptionPattern": "REPLACE_ALL_ZEROS"
+            }
+          }
+        },
+        {
+          "fileName": "testfile3",
+          "faultInjection":{
+            "frequency": "INTERVAL",
+            "nRequests": 1,
+            "faultType":{
+              "type":"CORRUPT_CONTENT",
+              "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+              "offset": 1,
+              "index": 1
+            }
+          }
+        }
+       ]
+    },
+    "read":{
+      "files":[
+        {
+          "fileName": "testfile3",
+          "faultInjection":{
+            "frequency": "INTERVAL",
+            "nRequests": 1,
+            "faultType":{
+              "type":"CORRUPT_CONTENT",
+              "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+              "offset": 1,
+              "index": 1
+            }
+          }
+        }
+      ]
+    }
+  }
