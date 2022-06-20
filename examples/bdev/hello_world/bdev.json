@@ -24,6 +24,18 @@
 	  }
 	}
       ]
+    },
+    {
+      "subsystem": "bdev",
+      "config": [
+	{
+          "method": "bdev_passthru_create",
+	  "params": {
+            "name": "Passthru0",
+	    "base_bdev_name": "Faulty0"
+	  }
+	}
+      ]
     }
   ]
 }

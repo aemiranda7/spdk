@@ -1015,6 +1015,7 @@ int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 
 /**
  * Submit a write request to the bdev on the given channel.
+ * Optionally is possible to add some context using the flag parameter.
  *
  * \ingroup bdev_io_submit_functions
  *
@@ -1023,6 +1024,7 @@ int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \param buf Data buffer to written from.
  * \param offset The offset, in bytes, from the start of the block device.
  * \param nbytes The number of bytes to write. buf must be greater than or equal to this size.
+ * \param flag The context we want to propagate (optional).
  * \param cb Called when the request is complete.
  * \param cb_arg Argument passed to cb.
  *
@@ -1063,6 +1065,7 @@ int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 
 /**
  * Submit a write request to the bdev on the given channel.
+ * Optionally is possible to add some context using the flag parameter.
  *
  * \ingroup bdev_io_submit_functions
  *
@@ -1071,6 +1074,7 @@ int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \param buf Data buffer to written from.
  * \param offset_blocks The offset, in blocks, from the start of the block device.
  * \param num_blocks The number of blocks to write. buf must be greater than or equal to this size.
+ * \param flag The context we want to propagate (optional).
  * \param cb Called when the request is complete.
  * \param cb_arg Argument passed to cb.
  *
@@ -1118,6 +1122,7 @@ int spdk_bdev_write_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_c
  * Submit a write request to the bdev on the given channel. This function uses
  * separate buffer for metadata transfer (valid only if bdev supports this
  * mode).
+ * Optionally is possible to add some context using the flag parameter.
  *
  * \ingroup bdev_io_submit_functions
  *
@@ -1127,6 +1132,7 @@ int spdk_bdev_write_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_c
  * \param md Metadata buffer.
  * \param offset_blocks The offset, in blocks, from the start of the block device.
  * \param num_blocks The number of blocks to write. buf must be greater than or equal to this size.
+ * \param flag The context we want to propagate (optional).
  * \param cb Called when the request is complete.
  * \param cb_arg Argument passed to cb.
  *
@@ -1178,6 +1184,38 @@ int spdk_bdev_writev(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * gather list. Some physical devices place memory alignment requirements on
  * data and may not be able to directly transfer out of the buffers provided. In
  * this case, the request may fail.
+ * Optionally is possible to add some context using the flag parameter.
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param iov A scatter gather list of buffers to be written from.
+ * \param iovcnt The number of elements in iov.
+ * \param offset The offset, in bytes, from the start of the block device.
+ * \param len The size of data to write.
+ * \param flag The context we want to propagate (optional).
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
+ */
+int spdk_bdev_writev_flag(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+		     struct iovec *iov, int iovcnt,
+		     uint64_t offset, uint64_t len, void *flag,
+		     spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a write request to the bdev on the given channel. This differs from
+ * spdk_bdev_write by allowing the data buffer to be described in a scatter
+ * gather list. Some physical devices place memory alignment requirements on
+ * data and may not be able to directly transfer out of the buffers provided. In
+ * this case, the request may fail.
  *
  * \ingroup bdev_io_submit_functions
  *
@@ -1200,6 +1238,38 @@ int spdk_bdev_writev(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			    struct iovec *iov, int iovcnt,
 			    uint64_t offset_blocks, uint64_t num_blocks,
+			    spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a write request to the bdev on the given channel. This differs from
+ * spdk_bdev_write by allowing the data buffer to be described in a scatter
+ * gather list. Some physical devices place memory alignment requirements on
+ * data and may not be able to directly transfer out of the buffers provided. In
+ * this case, the request may fail.
+ * Optionally is possible to add some context using the flag parameter.
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param iov A scatter gather list of buffers to be written from.
+ * \param iovcnt The number of elements in iov.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to write.
+ * \param flag The context we want to propagate (optional).
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
+ */
+int spdk_bdev_writev_blocks_flag(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			    struct iovec *iov, int iovcnt,
+			    uint64_t offset_blocks, uint64_t num_blocks, void* flag,
 			    spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
@@ -1233,6 +1303,41 @@ int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel 
 int spdk_bdev_writev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				    struct iovec *iov, int iovcnt, void *md,
 				    uint64_t offset_blocks, uint64_t num_blocks,
+				    spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a write request to the bdev on the given channel. This differs from
+ * spdk_bdev_write by allowing the data buffer to be described in a scatter
+ * gather list. Some physical devices place memory alignment requirements on
+ * data or metadata and may not be able to directly transfer out of the buffers
+ * provided. In this case, the request may fail.  This function uses separate
+ * buffer for metadata transfer (valid only if bdev supports this mode).
+ * Optionally is possible to add some context using the flag parameter.
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param iov A scatter gather list of buffers to be written from.
+ * \param iovcnt The number of elements in iov.
+ * \param md Metadata buffer.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to write.
+ * \param flag The context we want to propagate (optional).
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range or separate
+ *               metadata is not supported
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
+ */
+int spdk_bdev_writev_blocks_with_md_flag(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				    struct iovec *iov, int iovcnt, void *md,
+				    uint64_t offset_blocks, uint64_t num_blocks, void *flag,
 				    spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**

@@ -312,7 +312,13 @@ vbdev_passthru_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if (bdev_io->u.bdev.md_buf == NULL) {
-			rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
+			if(bdev_io->flag != NULL){
+				rc = spdk_bdev_writev_blocks_flag(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
+						     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
+						     bdev_io->u.bdev.num_blocks, bdev_io->flag,_pt_complete_io,
+						     bdev_io);
+			}
+			else rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
 						     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
 						     bdev_io->u.bdev.num_blocks, _pt_complete_io,
 						     bdev_io);
