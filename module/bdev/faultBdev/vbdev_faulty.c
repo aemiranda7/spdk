@@ -106,9 +106,6 @@ struct spdk_file_faults{
 GHashTable *write_hashtable;
 GHashTable *read_hashtable;
 
-
-
-
 SPDK_BDEV_MODULE_REGISTER(faulty, &faulty_if)
 
 /* List of pt_bdev names and their base bdevs via configuration file.
@@ -243,6 +240,16 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		SPDK_ERRLOG("Error, original IO device_ctx is wrong! 0x%x\n",
 			    io_ctx->test);
 	}
+
+	char* file_id = (char *) orig_io->flag;
+	if(file_id && (orig_io->type==SPDK_BDEV_IO_TYPE_READ)){
+		printf("This read is for the file %s\n",(char*)orig_io->flag);
+		printf("The original content of read is %s\n",(char*)orig_io->u.bdev.iovs->iov_base);
+		corrupt_request_file(orig_io,file_id);
+		//free(file_id);
+	}
+
+	
 
 	/* Complete the original IO and then free the one that we created here
 	 * as a result of issuing an IO via submit_request.
@@ -400,26 +407,23 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		if (bdev_io->u.bdev.md_buf == NULL) {
+		if(bdev_io->flag){
+			 printf("This write is for the file %s\n",(char *)bdev_io->flag);
+			 printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
+			 corrupt_request_file(bdev_io,(char *)bdev_io->flag);
+		}
+		if (bdev_io->u.bdev.md_buf == NULL && rc==0) {
 			//corrupt_buffer(bdev_io->u.bdev.iovs->iov_base,bdev_io->u.bdev.iovs->iov_len,REPLACE_ALL_ZEROS,-1,-1);
 			//operation_delay(5);
 
 			//corrupt(bdev_io,spdk_thread_get_tag());
-			char* file_id = (char *) bdev_io->flag;
-			if(file_id){
-				//if(file_id->file_name){
-					 printf("This write is for the file %s\n",file_id);
-					 printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
-					 corrupt_request_file(bdev_io,file_id);
-				//}
-			}
 		    rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch, bdev_io->u.bdev.iovs,
 						     bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks,
 						     bdev_io->u.bdev.num_blocks, _pt_complete_io,
 						     bdev_io);
 			
 			//rc = medium_error(-1);
-		} else {
+		} else if (rc==0){
 			rc = spdk_bdev_writev_blocks_with_md(pt_node->base_desc, pt_ch->base_ch,
 							     bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
 							     bdev_io->u.bdev.md_buf,

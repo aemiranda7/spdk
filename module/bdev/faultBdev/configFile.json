@@ -53,6 +53,18 @@
               "index": 1
             }
           }
+        },
+        {
+          "fileName": "testfile",
+          "faultInjection":{
+            "frequency": "ALL",
+            "faultType":{
+              "type":"CORRUPT_CONTENT",
+              "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+              "offset": 0,
+              "index": 0
+            }
+          }
         }
       ]
     }
