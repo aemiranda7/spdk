@@ -30,15 +30,19 @@
 #  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
-
+FAULT_INJECTION_LIB := /home/gsd/fault-injection-framework/libs/libfops/build
 include $(SPDK_ROOT_DIR)/mk/spdk.app_vars.mk
 
 # Plugins go into build/example/
 FIO_PLUGIN := $(SPDK_ROOT_DIR)/build/fio/$(notdir $(FIO_PLUGIN))
 
 LIBS += $(SPDK_LIB_LINKER_ARGS)
+LIBS += `pkg-config --libs glib-2.0`
+LIBS += -L$(FAULT_INJECTION_LIB) -lfops
+LIBS += -L/usr/include/json-c -ljson-c
 
 CFLAGS += -I$(CONFIG_FIO_SOURCE_DIR)
+CFLAGS+= `pkg-config --cflags glib-2.0`
 # Compiling against fio 3.19 on latest FreeBSD generates warnings so we
 # cannot use -Werror
 ifeq ($(OS),FreeBSD)

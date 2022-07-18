@@ -805,7 +805,7 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 			rc = spdk_bdev_write(target->desc, target->ch,
 					     io_u->buf, io_u->offset, io_u->xfer_buflen,
 					     spdk_fio_completion_cb, fio_req);
-		} else {
+		} else { 
 			uint64_t zone_start, num_blocks;
 			if (spdk_fio_zone_bytes_to_blocks(target->bdev, io_u->offset, &zone_start,
 							  io_u->xfer_buflen, &num_blocks) != 0) {

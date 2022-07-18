@@ -145,6 +145,22 @@ bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *p
 }
 
 static void
+bdev_blob_read_flag(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+	       uint64_t lba, uint32_t lba_count, void *flag, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_read_blocks_flag(__get_desc(dev), channel, payload, lba,
+				   lba_count, flag, bdev_blob_io_complete, cb_args);
+	if (rc == -ENOMEM) {
+		bdev_blob_queue_io(dev, channel, payload, 0, lba,
+				   lba_count, SPDK_BDEV_IO_TYPE_READ, cb_args, NULL);
+	} else if (rc != 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
 bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
@@ -152,6 +168,22 @@ bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *
 
 	rc = spdk_bdev_write_blocks(__get_desc(dev), channel, payload, lba,
 				    lba_count, bdev_blob_io_complete, cb_args);
+	if (rc == -ENOMEM) {
+		bdev_blob_queue_io(dev, channel, payload, 0, lba,
+				   lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args, NULL);
+	} else if (rc != 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+bdev_blob_write_flag(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		uint64_t lba, uint32_t lba_count, void *flag, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_write_blocks_flag(__get_desc(dev), channel, payload, lba,
+				    lba_count, flag, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, payload, 0, lba,
 				   lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args, NULL);
@@ -178,6 +210,23 @@ bdev_blob_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 }
 
 static void
+bdev_blob_readv_flag(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		struct iovec *iov, int iovcnt,
+		uint64_t lba, uint32_t lba_count, void* flag, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_readv_blocks_flag(__get_desc(dev), channel, iov, iovcnt, lba,
+				    lba_count, flag, bdev_blob_io_complete, cb_args);
+	if (rc == -ENOMEM) {
+		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba,
+				   lba_count, SPDK_BDEV_IO_TYPE_READ, cb_args, NULL);
+	} else if (rc != 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
 bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		 struct iovec *iov, int iovcnt,
 		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
@@ -186,6 +235,23 @@ bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	rc = spdk_bdev_writev_blocks(__get_desc(dev), channel, iov, iovcnt, lba,
 				     lba_count, bdev_blob_io_complete, cb_args);
+	if (rc == -ENOMEM) {
+		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba,
+				   lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args, NULL);
+	} else if (rc != 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+bdev_blob_writev_flag(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		 struct iovec *iov, int iovcnt,
+		 uint64_t lba, uint32_t lba_count, void* flag, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_writev_blocks_flag(__get_desc(dev), channel, iov, iovcnt, lba,
+				     lba_count, flag, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba,
 				   lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args, NULL);
@@ -397,9 +463,13 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.destroy_channel = bdev_blob_destroy_channel;
 	b->bs_dev.destroy = bdev_blob_destroy;
 	b->bs_dev.read = bdev_blob_read;
+	b->bs_dev.read_flag = bdev_blob_read_flag;
 	b->bs_dev.write = bdev_blob_write;
+	b->bs_dev.write_flag = bdev_blob_write_flag;
 	b->bs_dev.readv = bdev_blob_readv;
+	b->bs_dev.readv_flag = bdev_blob_readv_flag;
 	b->bs_dev.writev = bdev_blob_writev;
+	b->bs_dev.writev_flag = bdev_blob_writev_flag;
 	b->bs_dev.readv_ext = bdev_blob_readv_ext;
 	b->bs_dev.writev_ext = bdev_blob_writev_ext;
 	b->bs_dev.write_zeroes = bdev_blob_write_zeroes;

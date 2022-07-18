@@ -109,9 +109,9 @@ hello_read(void *arg)
 	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
 
 	SPDK_NOTICELOG("Reading io\n");
-	char* flag = strdup("testfile");
+	//char* flag = strdup("testfile");
 	rc = spdk_bdev_read_flag(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			    hello_context->buff, 0, length, flag, read_complete, hello_context);
+			    hello_context->buff, 0, length, "testfile", read_complete, hello_context);
 	//free(flag);
 	if (rc == -ENOMEM) {
 		SPDK_NOTICELOG("Queueing io\n");
@@ -166,9 +166,9 @@ hello_write(void *arg)
 	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
 
 	SPDK_NOTICELOG("Writing to the bdev\n");
-	char* flag = strdup("testfile");
+	//char* flag = strdup("testfile");
 	rc = spdk_bdev_write_flag(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			     hello_context->buff, 0, length, flag, write_complete, hello_context);
+			     hello_context->buff, 0, length, "testfile", write_complete, hello_context);
 	//free(flag);
 	if (rc == -ENOMEM) {
 		SPDK_NOTICELOG("Queueing io\n");

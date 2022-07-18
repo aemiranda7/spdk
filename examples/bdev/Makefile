@@ -35,6 +35,7 @@ SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 DIRS-$(CONFIG_FIO_PLUGIN) = fio_plugin
+DIRS-$(CONFIG_FIO_PLUGIN) += fio_plugin_flag
 DIRS-y += hello_world
 
 .PHONY: all clean $(DIRS-y)

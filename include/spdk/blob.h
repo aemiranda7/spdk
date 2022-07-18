@@ -181,19 +181,37 @@ struct spdk_bs_dev {
 	void (*read)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		     uint64_t lba, uint32_t lba_count,
 		     struct spdk_bs_dev_cb_args *cb_args);
+	
+	void (*read_flag)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		     uint64_t lba, uint32_t lba_count, void *flag,
+		     struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*write)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		      uint64_t lba, uint32_t lba_count,
+		      struct spdk_bs_dev_cb_args *cb_args);
+	
+	void (*write_flag)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		      uint64_t lba, uint32_t lba_count, void *flag,
 		      struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*readv)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt,
 		      uint64_t lba, uint32_t lba_count,
 		      struct spdk_bs_dev_cb_args *cb_args);
+	
+	void (*readv_flag)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		      struct iovec *iov, int iovcnt,
+		      uint64_t lba, uint32_t lba_count, void *flag,
+		      struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*writev)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt,
 		       uint64_t lba, uint32_t lba_count,
+		       struct spdk_bs_dev_cb_args *cb_args);
+	
+	void (*writev_flag)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		       struct iovec *iov, int iovcnt,
+		       uint64_t lba, uint32_t lba_count, void *flag,
 		       struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*readv_ext)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,

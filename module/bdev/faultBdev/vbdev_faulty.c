@@ -243,12 +243,11 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	char* file_id = (char *) orig_io->flag;
 	if(file_id && (orig_io->type==SPDK_BDEV_IO_TYPE_READ)){
-		printf("This read is for the file %s\n",(char*)orig_io->flag);
-		printf("The original content of read is %s\n",(char*)orig_io->u.bdev.iovs->iov_base);
+		//printf("This read is for the file %s\n",(char*)orig_io->flag);
+		//printf("The original content of read is %s\n",(char*)orig_io->u.bdev.iovs->iov_base);
 		corrupt_request_file(orig_io,file_id);
 		//free(file_id);
 	}
-
 	
 
 	/* Complete the original IO and then free the one that we created here
@@ -394,6 +393,7 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 	struct faulty_bdev_io *io_ctx = (struct faulty_bdev_io *)bdev_io->driver_ctx;
 	int rc = 0;
 	
+	
 
 	/* Setup a per IO context value; we don't do anything with it in the vbdev other
 	 * than confirm we get the same thing back in the completion callback just to
@@ -408,8 +408,8 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if(bdev_io->flag){
-			 printf("This write is for the file %s\n",(char *)bdev_io->flag);
-			 printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
+			 //printf("This write is for the file %s\n",(char *)bdev_io->flag);
+			 //printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
 			 corrupt_request_file(bdev_io,(char *)bdev_io->flag);
 		}
 		if (bdev_io->u.bdev.md_buf == NULL && rc==0) {
@@ -1246,11 +1246,11 @@ vbdev_read_conf_file(void)
 
 	_load_wr_files(write,read);
 
-	printf("\n------------------WRITE HASHTABLE----------------\n");
-	_print_hashtable(write_hashtable);
+	//printf("\n------------------WRITE HASHTABLE----------------\n");
+	//_print_hashtable(write_hashtable);
 
-	printf("\n------------------READ HASHTABLE----------------\n");
-	_print_hashtable(read_hashtable);
+	//printf("\n------------------READ HASHTABLE----------------\n");
+	//_print_hashtable(read_hashtable);
 
 	return 0;
 }
@@ -1272,8 +1272,7 @@ corrupt_request_file(struct spdk_bdev_io *bdev_io,char* fileName){
 	if(fault->fault_freq == ALL_AFTER && current_total_requests<=fault->n_requests) return;
 
 	//If freq is interval of x and total requests can not be divided by x then do not corrupt
-	if(fault->fault_freq == INTERVAL && (current_total_requests%fault->n_requests)!=0) return;
-
+	if(fault->fault_freq == INTERVAL && ((current_total_requests%fault->n_requests)!=0 || current_total_requests==0)) return;
 	switch (fault->fault_type)
 	{
 	case CORRUPT_CONTENT:
