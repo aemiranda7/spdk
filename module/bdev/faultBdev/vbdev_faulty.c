@@ -408,7 +408,7 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if(bdev_io->flag){
-			 //printf("This write is for the file %s\n",(char *)bdev_io->flag);
+			 printf("This write is for the file %s\n",(char *)bdev_io->flag);
 			 //printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
 			 corrupt_request_file(bdev_io,(char *)bdev_io->flag);
 		}

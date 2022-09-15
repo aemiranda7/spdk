@@ -160,6 +160,8 @@ struct spdk_thread {
 	bool				poller_unregistered;
 	struct spdk_fd_group		*fgrp;
 
+	/*blobfs file id*/
+	struct bs_file_id *file_id;
 	/* User context allocated at the end */
 	uint8_t				ctx[0];
 };
@@ -506,6 +508,8 @@ spdk_thread_create(const char *name, struct spdk_cpuset *cpumask)
 		_free_thread(thread);
 		return NULL;
 	}
+
+	thread->file_id = NULL;
 
 	thread->state = SPDK_THREAD_STATE_RUNNING;
 
@@ -2684,4 +2688,23 @@ spdk_interrupt_mode_is_enabled(void)
 	return g_interrupt_mode;
 }
 
+
+
+struct bs_file_id* spdk_thread_get_file_id(void){
+	struct spdk_thread *thread = spdk_get_thread();
+	if(!thread){
+		SPDK_ERRLOG("Something went wrong getting the thread!!\n");
+		return NULL;
+	}
+	return thread->file_id;
+}
+
+void spdk_thread_set_file_id (struct bs_file_id *file_id){
+	struct spdk_thread *thread = spdk_get_thread();
+	if(!thread){
+		SPDK_ERRLOG("Something went wrong getting the thread!!\n");
+		return;
+	}
+	thread->file_id = file_id;
+}
 SPDK_LOG_REGISTER_COMPONENT(thread)

@@ -1796,7 +1796,16 @@ __do_blob_read(void *ctx, int fserrno)
 		__rw_done(req, fserrno);
 		return;
 	}
-	spdk_blob_io_read(args->file->blob, args->op.rw.channel,
+
+	struct bs_file_id *fid = spdk_thread_get_file_id();
+	if(fid){
+			spdk_thread_set_file_id(NULL);
+			spdk_blob_io_read_fid(args->file->blob, args->op.rw.channel,
+			  args->op.rw.pin_buf,
+			  args->op.rw.start_lba, args->op.rw.num_lba, fid,
+			  __read_done, req);
+		}
+	else spdk_blob_io_read(args->file->blob, args->op.rw.channel,
 			  args->op.rw.pin_buf,
 			  args->op.rw.start_lba, args->op.rw.num_lba,
 			  __read_done, req);
@@ -1890,10 +1899,19 @@ __readvwritev(struct spdk_file *file, struct spdk_io_channel *_channel,
 		spdk_file_truncate_async(file, offset + length, __do_blob_read, req);
 	} else if (!is_read && __is_lba_aligned(file, offset, length)) {
 		_copy_iovs_to_buf(args->op.rw.pin_buf, args->op.rw.length, args->iovs, args->iovcnt);
-		spdk_blob_io_write(args->file->blob, args->op.rw.channel,
+		struct bs_file_id *fid = spdk_thread_get_file_id();
+		if(fid){
+			spdk_thread_set_file_id(NULL);
+			spdk_blob_io_write_fid(args->file->blob, args->op.rw.channel,
 				   args->op.rw.pin_buf,
-				   args->op.rw.start_lba, args->op.rw.num_lba,
+				   args->op.rw.start_lba, args->op.rw.num_lba, fid,
 				   __rw_done, req);
+		}
+		else
+			spdk_blob_io_write(args->file->blob, args->op.rw.channel,
+					   args->op.rw.pin_buf,
+					   args->op.rw.start_lba, args->op.rw.num_lba,
+					   __rw_done, req);
 	} else {
 		__do_blob_read(req, 0);
 	}
@@ -1921,6 +1939,16 @@ spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *channel,
 }
 
 void
+spdk_file_write_async_fid(struct spdk_file *file, struct spdk_io_channel *channel,
+		      void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+		      spdk_file_op_complete cb_fn, void *cb_arg)
+{
+
+	spdk_thread_set_file_id(fid);
+	__readwrite(file, channel, payload, offset, length, cb_fn, cb_arg, 0);
+}
+
+void
 spdk_file_writev_async(struct spdk_file *file, struct spdk_io_channel *channel,
 		       struct iovec *iovs, uint32_t iovcnt, uint64_t offset, uint64_t length,
 		       spdk_file_op_complete cb_fn, void *cb_arg)
@@ -1938,6 +1966,17 @@ spdk_file_read_async(struct spdk_file *file, struct spdk_io_channel *channel,
 {
 	SPDK_DEBUGLOG(blobfs, "file=%s offset=%jx length=%jx\n",
 		      file->name, offset, length);
+	__readwrite(file, channel, payload, offset, length, cb_fn, cb_arg, 1);
+}
+
+void
+spdk_file_read_async_fid(struct spdk_file *file, struct spdk_io_channel *channel,
+		     void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+		     spdk_file_op_complete cb_fn, void *cb_arg)
+{
+	SPDK_DEBUGLOG(blobfs, "file=%s offset=%jx length=%jx\n",
+		      file->name, offset, length);
+	spdk_thread_set_file_id(fid);
 	__readwrite(file, channel, payload, offset, length, cb_fn, cb_arg, 1);
 }
 

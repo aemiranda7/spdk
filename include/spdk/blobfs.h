@@ -537,6 +537,23 @@ void spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *chann
 			   void *payload, uint64_t offset, uint64_t length,
 			   spdk_file_op_complete cb_fn, void *cb_arg);
 
+
+/**
+ * Write data to the given file.
+ *
+ * \param file File to write.
+ * \param channel I/O channel for asynchronous operations.
+ * \param payload The specified buffer which should contain the data to be transmitted.
+ * \param offset The beginning position to write data.
+ * \param length The size in bytes of data to write.
+ * \param fid File id
+ * \param cb_fn Called when the request is complete.
+ * \param cb_arg Argument passed to cb_fn.
+ */
+void spdk_file_write_async_fid(struct spdk_file *file, struct spdk_io_channel *channel,
+			   void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+			   spdk_file_op_complete cb_fn, void *cb_arg);
+
 /**
  * Read data to user buffer from the given file.
  *
@@ -550,6 +567,22 @@ void spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *chann
  */
 void spdk_file_read_async(struct spdk_file *file, struct spdk_io_channel *channel,
 			  void *payload, uint64_t offset, uint64_t length,
+			  spdk_file_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Read data to user buffer from the given file.
+ *
+ * \param file File to write.
+ * \param channel I/O channel for asynchronous operations.
+ * \param payload The specified buffer which will store the obtained data.
+ * \param offset The beginning position to read.
+ * \param length The size in bytes of data to read.
+ * \param fid File id
+ * \param cb_fn Called when the request is complete.
+ * \param cb_arg Argument passed to cb_fn.
+ */
+void spdk_file_read_async_fid(struct spdk_file *file, struct spdk_io_channel *channel,
+			  void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
 			  spdk_file_op_complete cb_fn, void *cb_arg);
 
 /**

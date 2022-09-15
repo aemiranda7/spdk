@@ -53,6 +53,7 @@ struct hello_context_t {
 	uint8_t *read_buff;
 	uint8_t *write_buff;
 	uint64_t io_unit_size;
+	struct bs_file_id *fid;
 	int rc;
 };
 
@@ -158,12 +159,12 @@ read_complete(void *arg1, int bserrno)
 		return;
 	}
 
+	memset(hello_context->write_buff, 0x5a, hello_context->io_unit_size);
 	/* Now let's make sure things match. */
 	match_res = memcmp(hello_context->write_buff, hello_context->read_buff,
 			   hello_context->io_unit_size);
 	if (match_res) {
-		unload_bs(hello_context, "Error in data compare", -1);
-		return;
+		SPDK_NOTICELOG("Error in data compare\n");
 	} else {
 		SPDK_NOTICELOG("read SUCCESS and data matches!\n");
 	}
@@ -209,6 +210,9 @@ write_complete(void *arg1, int bserrno)
 			  bserrno);
 		return;
 	}
+	//freeing the context passed in the write function. 
+	free(hello_context->fid->file_name);
+	free(hello_context->fid);
 
 	/* Now let's read back what we wrote and make sure it matches. */
 	read_blob(hello_context);
@@ -245,9 +249,11 @@ blob_write(struct hello_context_t *hello_context)
 	}
 
 	/* Let's perform the write, 1 io_unit at offset 0. */
-	spdk_blob_io_write(hello_context->blob, hello_context->channel,
+	hello_context->fid = malloc(sizeof(struct bs_file_id));
+	hello_context->fid->file_name = strdup("testfile");
+	spdk_blob_io_write_fid(hello_context->blob, hello_context->channel,
 			   hello_context->write_buff,
-			   0, 1, write_complete, hello_context);
+			   0, 1, hello_context->fid, write_complete, hello_context);
 }
 
 /*
@@ -430,7 +436,7 @@ hello_start(void *arg1)
 	 * However blobstore can be more tightly integrated into
 	 * any lower layer, such as NVMe for example.
 	 */
-	rc = spdk_bdev_create_bs_dev_ext("Malloc0", base_bdev_event_cb, NULL, &bs_dev);
+	rc = spdk_bdev_create_bs_dev_ext("Passthru0", base_bdev_event_cb, NULL, &bs_dev);
 	if (rc != 0) {
 		SPDK_ERRLOG("Could not create blob bdev, %s!!\n",
 			    spdk_strerror(-rc));

@@ -248,10 +248,9 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 
 	ctx->ready=false;
 	printf("WRITING TO FILE\n");
-	//struct bs_file_id *file_id = malloc(sizeof(struct bs_file_id *));
-	//file_id->file_name = spdk_file_get_name(ctx->test_file);
-	//spdk_thread_set_file_id(file_id);
-	spdk_file_write_async(ctx->test_file,ctx->async_channel,"OLA MUNDO\n",0,10,write_cb,ctx);
+	struct bs_file_id *file_id = malloc(sizeof(struct bs_file_id));
+	file_id->file_name = strdup(spdk_file_get_name(ctx->test_file));
+	spdk_file_write_async_fid(ctx->test_file,ctx->async_channel,"OLA MUNDO\n",0,10,file_id,write_cb,ctx);
 	while(!ctx->ready) poll_threads(ctx);
 
 	ctx->ready = false;
@@ -260,7 +259,8 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 
 	ctx->ready=false;
 	char buf[10];
-	spdk_file_read_async(ctx->test_file,ctx->async_channel,buf,0,10,read_cb,ctx);
+	file_id->file_name = strdup(spdk_file_get_name(ctx->test_file));
+	spdk_file_read_async_fid(ctx->test_file,ctx->async_channel,buf,0,10,file_id,read_cb,ctx);
 	while(!ctx->ready) poll_threads(ctx);
 	printf("%s\n",buf);
 

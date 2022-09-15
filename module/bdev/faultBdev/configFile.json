@@ -5,11 +5,11 @@
       {
         "fileName": "testfile",
         "faultInjection":{
-          "frequency": "INTERVAL",
-          "nRequests": 5,
+          "frequency": "ALL",
+          "nRequests": 1,
           "faultType":{
             "type":"CORRUPT_CONTENT",
-            "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+            "corruptionPattern":"BITFLIP_RANDOM_INDEX",
             "offset": 0,
             "index": 0
           }
@@ -22,11 +22,11 @@
       {
         "fileName": "testfile",
         "faultInjection":{
-          "frequency": "INTERVAL",
-          "nRequests": 5,
+          "frequency": "ALL",
+          "nRequests": 1,
           "faultType":{
             "type":"CORRUPT_CONTENT",
-            "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
+            "corruptionPattern":"BITFLIP_RANDOM_INDEX",
             "offset": 0,
             "index": 0
           }

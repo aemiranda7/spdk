@@ -55,6 +55,14 @@ enum spdk_thread_poller_rc {
 };
 
 /**
+ * struct that defines a file id
+ */
+struct bs_file_id{
+	char* file_name;
+};
+
+
+/**
  * A stackless, lightweight thread.
  */
 struct spdk_thread;
@@ -869,6 +877,12 @@ int spdk_interrupt_mode_enable(void);
  * \return True if interrupt mode is set, false otherwise.
  */
 bool spdk_interrupt_mode_is_enabled(void);
+
+
+struct bs_file_id* spdk_thread_get_file_id(void);
+
+void spdk_thread_set_file_id (struct bs_file_id *file_id);
+
 
 #ifdef __cplusplus
 }

@@ -2616,7 +2616,7 @@ blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 			break;
 		case SPDK_BLOB_READV:
 		case SPDK_BLOB_WRITEV:
-			SPDK_ERRLOG("readv/write not valid\n");
+			SPDK_ERRLOG("readv/writev not valid\n");
 			bs_sequence_finish(ctx->seq, -EINVAL);
 			free(ctx);
 			return;
@@ -7593,10 +7593,29 @@ void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			       SPDK_BLOB_WRITE);
 }
 
+
+void spdk_blob_io_write_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid, 
+			spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	spdk_thread_set_file_id(fid);
+	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE);
+}
+
 void spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       void *payload, uint64_t offset, uint64_t length,
 		       spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_READ);
+}
+
+void spdk_blob_io_read_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+		       void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+		       spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	spdk_thread_set_file_id(fid);
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_READ);
 }
@@ -7608,10 +7627,26 @@ void spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL);
 }
 
+void spdk_blob_io_writev_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			 struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+			 spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	spdk_thread_set_file_id(fid);
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL);
+}
+
 void spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 			spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL);
+}
+
+void spdk_blob_io_readv_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+			spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	spdk_thread_set_file_id(fid);
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL);
 }
 

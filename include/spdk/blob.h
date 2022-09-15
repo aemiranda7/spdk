@@ -62,6 +62,7 @@
 #define SPDK_BLOB_H
 
 #include "spdk/stdinc.h"
+#include "spdk/thread.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -779,6 +780,22 @@ void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Write data to a blob with the file id for blobfs
+ *
+ * \param blob Blob to write.
+ * \param channel The I/O channel used to submit requests.
+ * \param payload The specified buffer which should contain the data to be written.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
+ * \param fid the context of file id.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_blob_io_write_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid, 
+			spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Read data from a blob.
  *
  * \param blob Blob to read.
@@ -791,6 +808,23 @@ void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
  */
 void spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       void *payload, uint64_t offset, uint64_t length,
+		       spdk_blob_op_complete cb_fn, void *cb_arg);
+
+
+/**
+ * Read data from a blob.
+ *
+ * \param blob Blob to read.
+ * \param channel The I/O channel used to submit requests.
+ * \param payload The specified buffer which will store the obtained data.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
+ * \param fid the context of file id.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_blob_io_read_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+		       void *payload, uint64_t offset, uint64_t length, struct bs_file_id *fid,
 		       spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
@@ -811,6 +845,24 @@ void spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Write the data described by 'iov' to 'length' io_units beginning at 'offset' io_units
+ * into the blob.
+ *
+ * \param blob Blob to write.
+ * \param channel I/O channel used to submit requests.
+ * \param iov The pointer points to an array of iovec structures.
+ * \param iovcnt The number of buffers.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
+ * \param fid the context of file id.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_blob_io_writev_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			 struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length, struct bs_file_id *fid,
+			 spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Read 'length' io_units starting at 'offset' io_units into the blob into the memory
  * described by 'iov'.
  *
@@ -825,6 +877,24 @@ void spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel
  */
 void spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+			spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Read 'length' io_units starting at 'offset' io_units into the blob into the memory
+ * described by 'iov'.
+ *
+ * \param blob Blob to read.
+ * \param channel I/O channel used to submit requests.
+ * \param iov The pointer points to an array of iovec structures.
+ * \param iovcnt The number of buffers.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
+ * \param fid the context of file id.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_blob_io_readv_fid(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length, struct bs_file_id *fid,
 			spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**

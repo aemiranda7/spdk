@@ -346,7 +346,13 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	bs_dev->read(bs_dev, spdk_io_channel_from_ctx(channel), payload, lba, lba_count, &set->cb_args);
+	struct bs_file_id *fid = spdk_thread_get_file_id();
+	if(fid==NULL)
+		bs_dev->read(bs_dev, spdk_io_channel_from_ctx(channel), payload, lba, lba_count, &set->cb_args);
+	else{
+		bs_dev->read_flag(channel->dev, channel->dev_channel, payload, lba, lba_count, fid->file_name,&set->cb_args);
+		spdk_thread_set_file_id(NULL);
+	}
 }
 
 void
@@ -360,7 +366,13 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	struct bs_file_id *fid = spdk_thread_get_file_id();
+	if(fid==NULL)
+		channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	else{
+		channel->dev->read_flag(channel->dev, channel->dev_channel, payload, lba, lba_count, fid->file_name,&set->cb_args);
+		spdk_thread_set_file_id(NULL);
+	}
 }
 
 void
@@ -373,8 +385,15 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
-			    &set->cb_args);
+	struct bs_file_id *fid = spdk_thread_get_file_id();
+	if(fid==NULL)
+		channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
+						    &set->cb_args);
+	else{
+		channel->dev->write_flag(channel->dev, channel->dev_channel, payload, lba, lba_count, fid->file_name,
+						    &set->cb_args);
+		spdk_thread_set_file_id(NULL);
+	}
 }
 
 void
