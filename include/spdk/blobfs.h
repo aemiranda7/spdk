@@ -398,6 +398,17 @@ void spdk_file_set_priority(struct spdk_file *file, uint32_t priority);
 int spdk_file_sync(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx);
 
 /**
+ * Synchronize the data from the cache to the disk propagating context.
+ *
+ * \param file File to sync.
+ * \param ctx The thread context for this operation
+ * \param fid The file id
+ *
+ * \return 0 on success.
+ */
+int spdk_file_sync_fid(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, struct bs_file_id *fid);
+
+/**
  * Get the unique ID for the file.
  *
  * \param file File to get the ID.

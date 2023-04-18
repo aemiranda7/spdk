@@ -403,12 +403,13 @@ vbdev_faulty_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
+		//if(bdev_io->flag) printf("%s\n",(char*)bdev_io->flag);
 		spdk_bdev_io_get_buf(bdev_io, pt_read_get_buf_cb,
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if(bdev_io->flag){
-			 printf("This write is for the file %s\n",(char *)bdev_io->flag);
+			 //printf("This write is for the file %s\n",(char *)bdev_io->flag);
 			 //printf("The content of write is : %s\n",(char*)bdev_io->u.bdev.iovs->iov_base);
 			 corrupt_request_file(bdev_io,(char *)bdev_io->flag);
 		}
@@ -1211,7 +1212,7 @@ static void _load_wr_files(struct json_object *write, struct json_object *read){
 static int 
 vbdev_read_conf_file(void)
 {
-	FILE *confFile = fopen("/home/gsd/rocksdb-spdk/spdk/module/bdev/faultBdev/configFile.json","r");
+	FILE *confFile = fopen("/home/gsd/spdk/module/bdev/faultBdev/configFile.json","r");
 
 	if(!confFile){
 		SPDK_ERRLOG("Something went wrong opening configFile.json!!\n");
@@ -1246,8 +1247,8 @@ vbdev_read_conf_file(void)
 
 	_load_wr_files(write,read);
 
-	//printf("\n------------------WRITE HASHTABLE----------------\n");
-	//_print_hashtable(write_hashtable);
+	printf("\n------------------WRITE HASHTABLE----------------\n");
+	_print_hashtable(write_hashtable);
 
 	//printf("\n------------------READ HASHTABLE----------------\n");
 	//_print_hashtable(read_hashtable);
@@ -1262,20 +1263,23 @@ corrupt_request_file(struct spdk_bdev_io *bdev_io,char* fileName){
 	else if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) fault =  g_hash_table_lookup(read_hashtable, fileName);
 	else return;
 
-	if (!fault) return;
+	if (!fault)	return;
+	
 
 	pthread_mutex_lock(fault->req_lock);
 	int current_total_requests = fault->total_requests++;
+	//if (current_total_requests>316670) printf("nReq: %d",current_total_requests);
 	pthread_mutex_unlock(fault->req_lock);
 
 	//If freq is all_after x and total requests is not bigger than x then do not corrupt
-	if(fault->fault_freq == ALL_AFTER && current_total_requests<=fault->n_requests) return;
+	if(fault->fault_freq == ALL_AFTER && current_total_requests<fault->n_requests) return;
 
 	//If freq is interval of x and total requests can not be divided by x then do not corrupt
 	if(fault->fault_freq == INTERVAL && ((current_total_requests%fault->n_requests)!=0 || current_total_requests==0)) return;
 	switch (fault->fault_type)
 	{
 	case CORRUPT_CONTENT:
+		//printf("CORRUPTING!!, %ld, %ld\n",bdev_io->u.bdev.iovs->iov_len, bdev_io->u.bdev.num_blocks);
 		corrupt_buffer(bdev_io->u.bdev.iovs->iov_base,
 					   bdev_io->u.bdev.iovs->iov_len,
 					   fault->u.content_corruption.pattern,

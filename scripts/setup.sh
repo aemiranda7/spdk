@@ -324,11 +324,11 @@ function verify_bdf_block_devs() {
 	local blknames
 	blknames=($(get_used_bdf_block_devs "$bdf")) || return 1
 
-	if ((${#blknames[@]} > 0)); then
-		local IFS=","
-		pci_dev_echo "$bdf" "Active devices: ${blknames[*]}, so not binding PCI dev"
-		return 1
-	fi
+	#if ((${#blknames[@]} > 0)); then
+	#	local IFS=","
+	#	pci_dev_echo "$bdf" "Active devices: ${blknames[*]}, so not binding PCI dev"
+	#	return 1
+	#fi
 }
 
 function configure_linux_pci() {

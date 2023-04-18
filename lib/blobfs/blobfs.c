@@ -1779,9 +1779,11 @@ __read_done(void *ctx, int bserrno)
 		__rw_done(req, 0);
 	} else {
 		_copy_iovs_to_buf(buf, args->op.rw.length, args->iovs, args->iovcnt);
-		spdk_blob_io_write(args->file->blob, args->op.rw.channel,
+		struct bs_file_id *fid = malloc(sizeof(struct bs_file_id));
+	    fid->file_name=strdup(spdk_file_get_name(args->file));
+		spdk_blob_io_write_fid(args->file->blob, args->op.rw.channel,
 				   args->op.rw.pin_buf,
-				   args->op.rw.start_lba, args->op.rw.num_lba,
+				   args->op.rw.start_lba, args->op.rw.num_lba, fid,
 				   __rw_done, req);
 	}
 }
@@ -1935,6 +1937,7 @@ spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *channel,
 		      void *payload, uint64_t offset, uint64_t length,
 		      spdk_file_op_complete cb_fn, void *cb_arg)
 {
+	
 	__readwrite(file, channel, payload, offset, length, cb_fn, cb_arg, 0);
 }
 
@@ -2393,9 +2396,14 @@ __file_flush(void *ctx)
 	BLOBFS_TRACE(file, "offset=0x%jx length=0x%jx page start=0x%jx num=0x%jx\n",
 		     offset, length, start_lba, num_lba);
 	pthread_spin_unlock(&file->lock);
-	spdk_blob_io_write(file->blob, file->fs->sync_target.sync_fs_channel->bs_channel,
+	struct bs_file_id *fid = malloc(sizeof(struct bs_file_id));
+	fid->file_name = strdup(file->name);
+	/*if(!fid) spdk_blob_io_write(file->blob, file->fs->sync_target.sync_fs_channel->bs_channel,
 			   next->buf + (start_lba * lba_size) - next->offset,
-			   start_lba, num_lba, __file_flush_done, req);
+			   start_lba, num_lba, __file_flush_done, req);*/
+	spdk_blob_io_write_fid(file->blob, file->fs->sync_target.sync_fs_channel->bs_channel,
+			   next->buf + (start_lba * lba_size) - next->offset,
+			   start_lba, num_lba, fid, __file_flush_done, req);
 }
 
 static void
@@ -2633,9 +2641,11 @@ __readahead(void *ctx)
 
 	BLOBFS_TRACE(file, "offset=%jx length=%jx page start=%jx num=%jx\n",
 		     offset, length, start_lba, num_lba);
-	spdk_blob_io_read(file->blob, file->fs->sync_target.sync_fs_channel->bs_channel,
+	struct bs_file_id *fid = malloc(sizeof(struct bs_file_id));
+	fid->file_name=strdup(spdk_file_get_name(file));
+	spdk_blob_io_read_fid(file->blob, file->fs->sync_target.sync_fs_channel->bs_channel,
 			  args->op.readahead.cache_buffer->buf,
-			  start_lba, num_lba, __readahead_done, req);
+			  start_lba, num_lba,fid,__readahead_done, req);
 }
 
 static uint64_t
@@ -2830,6 +2840,20 @@ spdk_file_sync(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx)
 	struct spdk_fs_cb_args args = {};
 
 	args.sem = &channel->sem;
+	_file_sync(file, channel, __wake_caller, &args);
+	sem_wait(&channel->sem);
+
+	return args.rc;
+}
+
+int
+spdk_file_sync_fid(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, struct bs_file_id *fid)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	struct spdk_fs_cb_args args = {};
+
+	args.sem = &channel->sem;
+	spdk_thread_set_file_id(fid);
 	_file_sync(file, channel, __wake_caller, &args);
 	sem_wait(&channel->sem);
 

@@ -8,12 +8,153 @@
 #include "spdk/string.h"
 #include "spdk/blob_bdev.h"
 #include "spdk/thread.h"
+
 //#include "blobfs/blobfs.c"
+
+//-------------------------------MD5 Implementation--------------------------------
+/*typedef union uwb {
+	unsigned w;
+	unsigned char b[4];
+} MD5union;
+
+typedef unsigned DigestArray[4];
+
+unsigned func0(unsigned abcd[]) {
+	return (abcd[1] & abcd[2]) | (~abcd[1] & abcd[3]);
+}
+
+unsigned func1(unsigned abcd[]) {
+	return (abcd[3] & abcd[1]) | (~abcd[3] & abcd[2]);
+}
+
+unsigned func2(unsigned abcd[]) {
+	return  abcd[1] ^ abcd[2] ^ abcd[3];
+}
+
+unsigned func3(unsigned abcd[]) {
+	return abcd[2] ^ (abcd[1] | ~abcd[3]);
+}
+
+typedef unsigned(*DgstFctn)(unsigned a[]);
+
+unsigned *calctable(unsigned *k)
+{
+	double s, pwr;
+	int i;
+
+	pwr = pow(2.0, 32);
+	for (i = 0; i<64; i++) {
+		s = fabs(sin(1.0 + i));
+		k[i] = (unsigned)(s * pwr);
+	}
+	return k;
+}
+
+unsigned rol(unsigned r, short N)
+{
+	unsigned  mask1 = (1 << N) - 1;
+	return ((r >> (32 - N)) & mask1) | ((r << N) & ~mask1);
+}
+
+unsigned* Algorithms_Hash_MD5(const char *msg, int mlen)
+{
+	static DigestArray h0 = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476 };
+	static DgstFctn ff[] = { &func0, &func1, &func2, &func3 };
+	static short M[] = { 1, 5, 3, 7 };
+	static short O[] = { 0, 1, 5, 0 };
+	static short rot0[] = { 7, 12, 17, 22 };
+	static short rot1[] = { 5, 9, 14, 20 };
+	static short rot2[] = { 4, 11, 16, 23 };
+	static short rot3[] = { 6, 10, 15, 21 };
+	static short *rots[] = { rot0, rot1, rot2, rot3 };
+	static unsigned kspace[64];
+	static unsigned *k;
+
+	static DigestArray h;
+	DigestArray abcd;
+	DgstFctn fctn;
+	short m, o, g;
+	unsigned f;
+	short *rotn;
+	union {
+		unsigned w[16];
+		char     b[64];
+	}mm;
+	int os = 0;
+	int grp, grps, q, p;
+	unsigned char *msg2;
+
+	if (k == NULL) k = calctable(kspace);
+
+	for (q = 0; q<4; q++) h[q] = h0[q];
+
+	{
+		grps = 1 + (mlen + 8) / 64;
+		msg2 = (unsigned char*)malloc(64 * grps);
+		memcpy(msg2, msg, mlen);
+		msg2[mlen] = (unsigned char)0x80;
+		q = mlen + 1;
+		while (q < 64 * grps) { msg2[q] = 0; q++; }
+		{
+			MD5union u;
+			u.w = 8 * mlen;
+			q -= 8;
+			memcpy(msg2 + q, &u.w, 4);
+		}
+	}
+
+	for (grp = 0; grp<grps; grp++)
+	{
+		memcpy(mm.b, msg2 + os, 64);
+		for (q = 0; q<4; q++) abcd[q] = h[q];
+		for (p = 0; p<4; p++) {
+			fctn = ff[p];
+			rotn = rots[p];
+			m = M[p]; o = O[p];
+			for (q = 0; q<16; q++) {
+				g = (m*q + o) % 16;
+				f = abcd[1] + rol(abcd[0] + fctn(abcd) + k[q + 16 * p] + mm.w[g], rotn[q % 4]);
+
+				abcd[0] = abcd[3];
+				abcd[3] = abcd[2];
+				abcd[2] = abcd[1];
+				abcd[1] = f;
+			}
+		}
+		for (p = 0; p<4; p++)
+			h[p] += abcd[p];
+		os += 64;
+	}
+	return h;
+}
+
+const char* GetMD5String(const char *msg, int mlen) {
+	char* str = malloc(33*sizeof(char));
+	strcpy(str, "");
+	int j, k;
+	unsigned *d = Algorithms_Hash_MD5(msg, strlen(msg));
+	MD5union u;
+	for (j = 0; j<4; j++) {
+		u.w = d[j];
+		char* s[8];
+		sprintf(s, "%02x%02x%02x%02x", u.b[0], u.b[1], u.b[2], u.b[3]);
+		strcat(str, s);
+	}
+
+	return str;
+}*/
+//-------------------------End of MD5 implementation---------------------------------
+
+
+
+
 
 static uint64_t g_cluster_size;
 
 uint32_t g_lcore = -1;
 //static bool g_thread_exit = false;
+
+size_t bs = 4096;
 
 struct blobfs_operation_ctx {
 	struct spdk_app_opts              *opts;
@@ -24,16 +165,26 @@ struct blobfs_operation_ctx {
 	struct spdk_fs_thread_ctx *sync_channel;
 	struct spdk_io_channel   *async_channel;
 	struct spdk_thread      *working_thread;
-	struct spdk_thread      *main_thread;
-	struct spdk_file        *test_file;
+	struct spdk_thread         *main_thread;
+	struct spdk_file             *test_file;
 	
+	int bionic_fd;
+	int  focal_fd;      
+	int  jammy_fd;
 
+	size_t bionic_size;
+	size_t  focal_size;
+	size_t  jammy_size;
 
 	pthread_t                     thread_id;
 	volatile bool                     ready;
-	volatile bool                            working;
+	volatile bool                   working;
 };
 
+char* bionic_path = "/home/gsd/blobfs_data/bionic-server-cloudimg-amd64.img";
+char* new_bionic_path = "/home/gsd/blobfs_data/bionic-server-cloudimg-amd64.spdk.img";
+char* focal_path = "/home/gsd/blobfs_data/focal-server-cloudimg-amd64.img";
+char* jammy_path = "/home/gsd/blobfs_data/jammy-server-cloudimg-amd64.img";
 
 
 static void poll_threads(struct blobfs_operation_ctx* ctx){
@@ -129,10 +280,10 @@ blobfs_unload(void *_ctx)
 static void write_cb(void*arg,int fserrno){
 	struct blobfs_operation_ctx *ctx = arg;
 	if(fserrno == 0){
-		 printf("write completed!\n");
+		 //printf("write completed!\n");
 	//	 spdk_thread_set_file_id(NULL);
 	}
-	else printf("write failed!\n");
+	else ;//printf("write failed!\n");
 	ctx->ready = true;
 
 }
@@ -147,7 +298,7 @@ static void read_cb(void*arg,int fserrno){
 
 static void sync_cb(void*arg,int fserrno){
 	struct blobfs_operation_ctx *ctx = arg;
-	if(fserrno == 0) printf("sync completed!\n");
+	if(fserrno == 0){} //printf("sync completed!\n");
 	else printf("sync failed!\n");
 	ctx->ready = true;
 
@@ -193,12 +344,6 @@ static void stat_cb(void*arg,struct spdk_file_stat* stats,int fserrno){
 static void
 fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 {
-
-	struct blobfs_operation_ctx *ctx = arg;
-
-	ctx->fs = fs;
-	ctx->fserrno = fserrno;
-
 	if(fserrno==0){ 
 		
 		SPDK_NOTICELOG("\nPreencheu fs!\n");
@@ -213,6 +358,31 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 		return;
 
 	}
+
+	struct blobfs_operation_ctx *ctx = arg;
+
+	ctx->fs = fs;
+	ctx->fserrno = fserrno;
+
+	//open the files
+	ctx->bionic_fd = open(bionic_path,O_RDONLY);
+	//ctx->focal_fd = open(focal_path,O_RDONLY);
+	//ctx->jammy_fd = open(jammy_path,O_RDONLY);
+
+	//find out the size of the files
+	ctx->bionic_size = lseek(ctx->bionic_fd, 0, SEEK_END); lseek(ctx->bionic_fd, 0, SEEK_SET);
+	//ctx->focal_size  = lseek(ctx->focal_fd, 0,  SEEK_END); lseek(ctx->focal_fd, 0,  SEEK_SET);
+	//ctx->jammy_size  = lseek(ctx->jammy_fd, 0,  SEEK_END); lseek(ctx->jammy_fd, 0,  SEEK_SET);
+
+
+	size_t align = spdk_bdev_get_buf_align(ctx->bs_dev->get_base_bdev(ctx->bs_dev));
+
+	//allocate the buffers and fill them with the files
+	//void* bionic_payload = spdk_dma_zmalloc(bs, align, NULL);// read(ctx->bionic_fd, bionic_payload, ctx->bionic_size);
+	//void* focal_payload  = spdk_dma_zmalloc(ctx->focal_size,  align, NULL); read(ctx->focal_fd,   focal_payload,  ctx->focal_size);
+	//void* jammy_payload  = spdk_dma_zmalloc(ctx->jammy_size,  align, NULL); read(ctx->jammy_fd,   jammy_payload,  ctx->jammy_size);
+
+	
 
 	// create spdk thread here
     if( ctx->working_thread == NULL )
@@ -240,30 +410,67 @@ fs_op_with_handle_complete(void *arg, struct spdk_filesystem *fs, int fserrno)
 	printf("CREATING FILE\n");
 	spdk_fs_create_file(fs,ctx->sync_channel,"testfile");
 
+	//spdk_fs_free_io_channel(ctx->async_channel);
+
 	//while(!ctx->ready) poll_threads(ctx);
 
 	printf("Opening FILE\n");
 	spdk_fs_open_file_async(fs,"testfile",SPDK_BLOBFS_OPEN_CREATE,open_cb,ctx);
 	while(ctx->test_file==NULL) poll_threads(ctx);
 
+	
 	ctx->ready=false;
 	printf("WRITING TO FILE\n");
 	struct bs_file_id *file_id = malloc(sizeof(struct bs_file_id));
 	file_id->file_name = strdup(spdk_file_get_name(ctx->test_file));
-	spdk_file_write_async_fid(ctx->test_file,ctx->async_channel,"OLA MUNDO\n",0,10,file_id,write_cb,ctx);
-	while(!ctx->ready) poll_threads(ctx);
+	
+	
+	for(uint64_t off = 0;off<=ctx->bionic_size;off+=bs){
+		uint64_t s = bs;
+		if(off+bs>ctx->bionic_size) s = ctx->bionic_size - (off+1);
+		void* bionic_payload = spdk_dma_zmalloc(bs, align, NULL);
+		if(read(ctx->bionic_fd, bionic_payload, s)<=0) printf("READ ERROR : %lu",off);
+		//ctx->async_channel = spdk_fs_alloc_io_channel(ctx->fs);
+		spdk_file_write_async(ctx->test_file,ctx->async_channel,bionic_payload,off,s,write_cb,ctx);
+		while(!ctx->ready) poll_threads(ctx);
+		ctx->ready = false;
+		spdk_file_sync_async(ctx->test_file,ctx->async_channel,sync_cb,ctx);
+		while(!ctx->ready) poll_threads(ctx);
+		ctx->ready = false;
+		spdk_file_sync_async(ctx->test_file,ctx->async_channel,sync_cb,ctx);
+		while(!ctx->ready) poll_threads(ctx);
+		//spdk_fs_free_io_channel(ctx->async_channel);
 
-	ctx->ready = false;
-	spdk_file_sync_async(ctx->test_file,ctx->async_channel,sync_cb,ctx);
-	while(!ctx->ready) poll_threads(ctx);
+		spdk_dma_free(bionic_payload);
+	}
 
+	
+
+
+	void* bionic_payload_spdk = spdk_dma_zmalloc(ctx->bionic_size, align, NULL);
+	
 	ctx->ready=false;
-	char buf[10];
+	//char* buf = spdk_dma_zmalloc(2, align, NULL);
 	file_id->file_name = strdup(spdk_file_get_name(ctx->test_file));
-	spdk_file_read_async_fid(ctx->test_file,ctx->async_channel,buf,0,10,file_id,read_cb,ctx);
+	spdk_file_read_async_fid(ctx->test_file,ctx->async_channel,bionic_payload_spdk,0,ctx->bionic_size,file_id,read_cb,ctx);
 	while(!ctx->ready) poll_threads(ctx);
-	printf("%s\n",buf);
+	//printf("%s\n",buf);
 
+	int bionic_spdk_fd = open(new_bionic_path,O_CREAT|O_WRONLY,0777);
+
+	write(bionic_spdk_fd,bionic_payload_spdk,ctx->bionic_size);
+
+	/*char* nValue = GetMD5String(buf,700);
+
+	if(strcmp(value,nValue)){
+		SPDK_NOTICELOG("The value is not the same!!!\n");
+		printf("value: %s\n",value);
+		printf("value: %s\n",nValue);
+
+	} */
+
+	//write(ctx->focal_fd,buf,2);
+	
 	ctx->ready=false;
 	spdk_file_close_async(ctx->test_file,close_cb,ctx);
 	while(!ctx->ready) poll_threads(ctx);
@@ -400,7 +607,9 @@ int main(int argc, char **argv)
 
     pthread_create( &ctx->thread_id, &attr, &initialize_spdk, ctx );
 
-    while( !ctx->ready ){}
+    while( !ctx->ready ){
+		
+	}
 
 	//const char * nameThread = spdk_thread_get_name(spdk_get_thread());
 	printf("NThreads: %d\n",spdk_thread_get_count());

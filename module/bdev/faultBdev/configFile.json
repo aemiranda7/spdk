@@ -3,13 +3,13 @@
   "write":{
     "files":[
       {
-        "fileName": "testfile",
+        "fileName": "bionic",
         "faultInjection":{
-          "frequency": "ALL",
-          "nRequests": 1,
+          "frequency": "INTERVAL",
+          "nRequests": 500,
           "faultType":{
             "type":"CORRUPT_CONTENT",
-            "corruptionPattern":"BITFLIP_RANDOM_INDEX",
+            "corruptionPattern":"BITFLIP_CUSTOM_INDEX",
             "offset": 0,
             "index": 0
           }
@@ -20,7 +20,7 @@
   "read":{
     "files":[
       {
-        "fileName": "testfile",
+        "fileName": "nofault",
         "faultInjection":{
           "frequency": "ALL",
           "nRequests": 1,
